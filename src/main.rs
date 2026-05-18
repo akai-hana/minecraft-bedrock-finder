@@ -794,19 +794,25 @@ fn main() {
 
     loop {
         for slot in chunk.iter_mut() {
+            // 1. Record the current valid coordinate pair
             *slot = (x, z);
 
-            if steps_taken >= steps_to_take {
-                steps_taken = 0;
-                sides_until_incremental += 1;
-                dir = dir.next();
-            }
-            if sides_until_incremental > 2 {
-                sides_until_incremental = 0;
-                steps_to_take += 1;
-            }
+            // 2. Take the physical step in the current direction
             dir.step(&mut x, &mut z);
             steps_taken += 1;
+
+            // 3. Check if we finished the current segment length
+            if steps_taken == steps_to_take {
+                steps_taken = 0;
+                dir = dir.next();
+                sides_until_incremental += 1;
+
+                // Every 2 sides completed, increase the segment length by 1
+                if sides_until_incremental == 2 {
+                    sides_until_incremental = 0;
+                    steps_to_take += 1;
+                }
+            }
         }
 
         if let Some(idx) = search_chunk(&chunk, dlo, dhi, &blocks, simd) {
