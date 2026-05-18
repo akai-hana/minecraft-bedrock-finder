@@ -1,0 +1,19 @@
+[package]
+name    = "bedrockformation"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "bedrockformation"
+path = "src/main.rs"
+
+[dependencies]
+md5   = "0.7"
+rayon = "1"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols" # "debuginfo" keeps symbol names; "symbols" strips them too
