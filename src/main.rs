@@ -7,8 +7,10 @@
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use iced::{
-    Application, Command, Element, Length, Settings, Theme, Alignment,
+    Application, Command, Element, Event, Length, Settings, Subscription, Theme, Alignment,
     executor, theme,
+    keyboard::{self, Key},
+    event,
     widget::{button, checkbox, container, horizontal_rule, mouse_area, radio, row, scrollable, text, text_input, Column, Row, Space},
     window,
 };
@@ -707,8 +709,8 @@ impl Dir {
 fn main() -> iced::Result {
     App::run(Settings {
         window: window::Settings {
-            size: iced::Size::new(820.0, 720.0),
-            min_size: Some(iced::Size::new(680.0, 560.0)),
+            size: iced::Size::new(800.0, 650.0),
+            min_size: Some(iced::Size::new(620.0, 400.0)),
             ..Default::default()
         },
         ..Default::default()
@@ -975,6 +977,8 @@ struct App {
     search_all_rotations: bool,
     status:        SearchStatus,
     cancel_flag:   Option<Arc<AtomicBool>>,
+    /// UI zoom level: 1.0 = default, range 0.5–2.0 in steps of 0.1.
+    ui_scale:      f32,
 }
 
 impl Default for App {
@@ -997,6 +1001,7 @@ impl Default for App {
             search_all_rotations: false,
             status:        SearchStatus::Idle,
             cancel_flag:   None,
+            ui_scale:      1.0,
         }
     }
 }
@@ -1025,6 +1030,8 @@ enum Message {
     Search,
     Cancel,
     SearchDone(Result<Option<(i32, i32)>, String>),
+    ZoomIn,
+    ZoomOut,
 }
 
 // GUI - Application impl
@@ -1042,6 +1049,29 @@ impl Application for App {
     fn title(&self) -> String { String::from("Bedrock Formation Finder") }
 
     fn theme(&self) -> Theme { Theme::GruvboxDark }
+
+    fn subscription(&self) -> Subscription<Message> {
+        event::listen_with(|event, _| {
+            if let Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                ..
+            }) = event {
+                if modifiers.control() {
+                    match &key {
+                        Key::Character(c) if matches!(c.as_str(), "+" | "=") => {
+                            return Some(Message::ZoomIn);
+                        }
+                        Key::Character(c) if c.as_str() == "-" => {
+                            return Some(Message::ZoomOut);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None
+        })
+    }
 
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
@@ -1196,6 +1226,15 @@ impl Application for App {
                 Command::none()
             }
 
+            Message::ZoomIn => {
+                self.ui_scale = (self.ui_scale + 0.1).min(2.0);
+                Command::none()
+            }
+            Message::ZoomOut => {
+                self.ui_scale = (self.ui_scale - 0.1).max(0.5);
+                Command::none()
+            }
+
             Message::SearchDone(result) => {
                 self.cancel_flag = None;
                 self.status = match result {
@@ -1210,86 +1249,89 @@ impl Application for App {
 
     fn view(&self) -> Element<'_, Message> {
         let is_searching = self.status == SearchStatus::Searching;
+        let s = self.ui_scale;
+        // Helper: scale a fixed pixel value by the zoom factor.
+        let sc = |v: f32| v * s;
 
         let seed_row = row![
-            text("World Seed").width(Length::Fixed(130.0)),
+            text("World Seed").width(Length::Fixed(sc(130.0))),
             text_input("e.g. 124352345", &self.seed)
                 .on_input(Message::SeedChanged)
                 .width(Length::Fill)
-                .padding(8),
-        ].spacing(12).align_items(Alignment::Center);
+                .padding(sc(8.0) as u16),
+        ].spacing(sc(12.0) as u16).align_items(Alignment::Center);
 
         let center_row = row![
-            text("Search Center").width(Length::Fixed(130.0)),
+            text("Search Center").width(Length::Fixed(sc(130.0))),
             text("X"),
-            text_input("0", &self.center_x).on_input(Message::CenterXChanged).width(Length::Fixed(90.0)).padding(8),
+            text_input("0", &self.center_x).on_input(Message::CenterXChanged).width(Length::Fixed(sc(90.0))).padding(sc(8.0) as u16),
             text("Z"),
-            text_input("0", &self.center_z).on_input(Message::CenterZChanged).width(Length::Fixed(90.0)).padding(8),
-        ].spacing(10).align_items(Alignment::Center);
+            text_input("0", &self.center_z).on_input(Message::CenterZChanged).width(Length::Fixed(sc(90.0))).padding(sc(8.0) as u16),
+        ].spacing(sc(10.0) as u16).align_items(Alignment::Center);
 
         let type_row = row![
-            text("Bedrock Layer").width(Length::Fixed(130.0)),
+            text("Bedrock Layer").width(Length::Fixed(sc(130.0))),
             radio("Floor (Y -64 to -59)", BedrockType::Floor, Some(self.bedrock_type), Message::TypeChanged),
-            Space::with_width(Length::Fixed(20.0)),
+            Space::with_width(Length::Fixed(sc(20.0))),
             radio("Roof  (Y 123 to 128)", BedrockType::Roof,  Some(self.bedrock_type), Message::TypeChanged),
-        ].spacing(10).align_items(Alignment::Center);
+        ].spacing(sc(10.0) as u16).align_items(Alignment::Center);
 
         // Grid size + offset controls
         let grid_controls = row![
-            text("Grid Size").width(Length::Fixed(80.0)),
+            text("Grid Size").width(Length::Fixed(sc(80.0))),
             text("Cols"),
             text_input("8", &self.grid_cols_str)
                 .on_input(Message::GridColsChanged)
-                .width(Length::Fixed(46.0))
-                .padding(7),
+                .width(Length::Fixed(sc(46.0)))
+                .padding(sc(7.0) as u16),
             text("Rows"),
             text_input("8", &self.grid_rows_str)
                 .on_input(Message::GridRowsChanged)
-                .width(Length::Fixed(46.0))
-                .padding(7),
-            Space::with_width(Length::Fixed(20.0)),
-            text("Offset").width(Length::Fixed(48.0)),
+                .width(Length::Fixed(sc(46.0)))
+                .padding(sc(7.0) as u16),
+            Space::with_width(Length::Fixed(sc(20.0))),
+            text("Offset").width(Length::Fixed(sc(48.0))),
             text("X"),
             text_input("0", &self.grid_offset_x)
                 .on_input(Message::GridOffsetXChanged)
-                .width(Length::Fixed(58.0))
-                .padding(7),
+                .width(Length::Fixed(sc(58.0)))
+                .padding(sc(7.0) as u16),
             text("Z"),
             text_input("0", &self.grid_offset_z)
                 .on_input(Message::GridOffsetZChanged)
-                .width(Length::Fixed(58.0))
-                .padding(7),
-        ].spacing(8).align_items(Alignment::Center);
+                .width(Length::Fixed(sc(58.0)))
+                .padding(sc(7.0) as u16),
+        ].spacing(sc(8.0) as u16).align_items(Alignment::Center);
 
         // Y-layer tab strip
         // Tabs marked with * have at least one non-Unknown cell.
         let ys = y_values(self.bedrock_type);
         let mut y_row: Row<'_, Message> = Row::new()
-            .spacing(6)
+            .spacing(sc(6.0) as u16)
             .align_items(Alignment::Center)
-            .push(text("Y Layer").width(Length::Fixed(70.0)));
+            .push(text("Y Layer").width(Length::Fixed(sc(70.0))));
         for (i, &y) in ys.iter().enumerate() {
             let has_data = self.grid_cells[i].iter()
                 .any(|r| r.iter().any(|&c| c != CellState::Unknown));
             let label = if has_data { format!("{}*", y) } else { y.to_string() };
             let btn = if i == self.grid_y_idx {
                 // Active tab: no on_press so it is not re-clickable
-                button(text(label).size(13))
+                button(text(label).size(sc(13.0) as u16))
                     .style(theme::Button::Primary)
-                    .padding([5, 10])
+                    .padding([sc(5.0) as u16, sc(10.0) as u16])
             } else {
-                button(text(label).size(13))
+                button(text(label).size(sc(13.0) as u16))
                     .style(theme::Button::Secondary)
                     .on_press(Message::GridYChanged(i))
-                    .padding([5, 10])
+                    .padding([sc(5.0) as u16, sc(10.0) as u16])
             };
             y_row = y_row.push(btn);
         }
 
         // Cell grid
-        let mut grid_col: Column<'_, Message> = Column::new().spacing(2);
+        let mut grid_col: Column<'_, Message> = Column::new().spacing(sc(2.0) as u16);
         for row_idx in 0..self.grid_rows {
-            let mut grid_row: Row<'_, Message> = Row::new().spacing(2);
+            let mut grid_row: Row<'_, Message> = Row::new().spacing(sc(2.0) as u16);
             for col_idx in 0..self.grid_cols {
                 let state = self.grid_cells[self.grid_y_idx][row_idx][col_idx];
                 let (label, style) = match state {
@@ -1299,7 +1341,7 @@ impl Application for App {
                 };
                 let cell = mouse_area(
                     button(
-                            container(text(label).size(15))
+                            container(text(label).size(sc(15.0) as u16))
                                 .width(Length::Fill)
                                 .height(Length::Fill)
                                 .center_x()
@@ -1307,8 +1349,8 @@ impl Application for App {
                         )
                         .on_press(Message::GridCellClicked(row_idx, col_idx))
                         .style(style)
-                        .width(Length::Fixed(30.0))
-                        .height(Length::Fixed(30.0))
+                        .width(Length::Fixed(sc(30.0)))
+                        .height(Length::Fixed(sc(30.0)))
                         .padding(0)
                 ).on_right_press(Message::GridCellRightClicked(row_idx, col_idx));
                 grid_row = grid_row.push(cell);
@@ -1317,79 +1359,98 @@ impl Application for App {
         }
 
         let rotate_row = row![
-            text("Rotate grid:").size(12).width(Length::Fixed(80.0)),
-            button(text("+90º (Clockwise)").size(13))
+            text("Rotate grid:").size(sc(12.0) as u16).width(Length::Fixed(sc(80.0))),
+            button(text("+90º (Clockwise)").size(sc(13.0) as u16))
                 .on_press(Message::RotateCW)
                 .style(theme::Button::Secondary)
                 .padding([4, 10]),
-            button(text("−90º (Counter-clockwise)").size(13))
+            button(text("−90º (Counter-clockwise)").size(sc(13.0) as u16))
                 .on_press(Message::RotateCCW)
                 .style(theme::Button::Secondary)
                 .padding([4, 10]),
-        ].spacing(8).align_items(Alignment::Center);
+        ].spacing(sc(8.0) as u16).align_items(Alignment::Center);
 
         let legend = row![
-            text("Click to cycle:").size(12),
-            Space::with_width(Length::Fixed(8.0)),
-            text("? Unknown").size(12),
-            Space::with_width(Length::Fixed(12.0)),
-            text("O Non-bedrock").size(12),
-            Space::with_width(Length::Fixed(12.0)),
-            text("X Bedrock").size(12),
+            text("Click to cycle:").size(sc(12.0) as u16),
+            Space::with_width(Length::Fixed(sc(8.0))),
+            text("? Unknown").size(sc(12.0) as u16),
+            Space::with_width(Length::Fixed(sc(12.0))),
+            text("O Non-bedrock").size(sc(12.0) as u16),
+            Space::with_width(Length::Fixed(sc(12.0))),
+            text("X Bedrock").size(sc(12.0) as u16),
         ].align_items(Alignment::Center);
 
         let all_rotations_row = row![
             checkbox(
                 "Search all 4 rotations (if north direction is unknown)",
                 self.search_all_rotations,
-            ).on_toggle(Message::ToggleAllRotations).text_size(13),
+            ).on_toggle(Message::ToggleAllRotations).text_size(sc(13.0) as u16),
         ].align_items(Alignment::Center);
 
         let search_btn = if is_searching {
-            button("Searching...").padding([10, 28])
+            button("Searching...").padding([sc(10.0) as u16, sc(28.0) as u16])
         } else {
-            button("Search").on_press(Message::Search).padding([10, 28])
+            button("Search").on_press(Message::Search).padding([sc(10.0) as u16, sc(28.0) as u16])
         };
         let cancel_btn = if is_searching {
-            button("Cancel").on_press(Message::Cancel).padding([10, 20])
+            button("Cancel").on_press(Message::Cancel).padding([sc(10.0) as u16, sc(20.0) as u16])
         } else {
-            button("Cancel").padding([10, 20])
+            button("Cancel").padding([sc(10.0) as u16, sc(20.0) as u16])
         };
 
         let status_msg = match &self.status {
             SearchStatus::Idle        => text("Ready when you are."),
             SearchStatus::Searching   => text("Looking for that juicy leaked stash..."),
             SearchStatus::Cancelled   => text("Search cancelled. :("),
-            SearchStatus::Found(x, z) => text(format!("Found formation at X: {}   Z: {}", x, z)).size(18),
+            SearchStatus::Found(x, z) => text(format!("Found formation at X: {}   Z: {}", x, z)).size(sc(18.0) as u16),
             SearchStatus::Error(e)    => text(format!("Error: {}", e)),
         };
 
+        let zoom_row = row![
+            text(format!("Zoom: {:.0}%", self.ui_scale * 100.0)).size(sc(12.0) as u16),
+            Space::with_width(Length::Fixed(8.0)),
+            button(text("−").size(sc(14.0) as u16))
+                .on_press(Message::ZoomOut)
+                .style(theme::Button::Secondary)
+                .padding([sc(3.0) as u16, sc(10.0) as u16]),
+            button(text("+").size(sc(14.0) as u16))
+                .on_press(Message::ZoomIn)
+                .style(theme::Button::Secondary)
+                .padding([sc(3.0) as u16, sc(10.0) as u16]),
+        ].spacing(4).align_items(Alignment::Center);
+
         let content = Column::new()
-            .spacing(2)
-            .padding(28)
-            .max_width(760)
-            .push(text("Bedrock Formation Finder").size(26))
-            .push(Space::with_height(Length::Fixed(4.0)))
+            .spacing(sc(2.0) as u16)
+            .padding(sc(16.0) as u16)
+            .max_width(sc(760.0))
+            .push(
+                row![
+                    text("Bedrock Formation Finder").size(sc(26.0) as u16),
+                    Space::with_width(Length::Fill),
+                    zoom_row,
+                ].align_items(Alignment::Center)
+            )
+            .push(Space::with_height(Length::Fixed(sc(4.0))))
             .push(horizontal_rule(1))
-            .push(Space::with_height(Length::Fixed(8.0)))
+            .push(Space::with_height(Length::Fixed(sc(6.0))))
             .push(seed_row)
             .push(center_row)
             .push(type_row)
-            .push(Space::with_height(Length::Fixed(8.0)))
+            .push(Space::with_height(Length::Fixed(sc(6.0))))
             .push(horizontal_rule(1))
-            .push(Space::with_height(Length::Fixed(8.0)))
+            .push(Space::with_height(Length::Fixed(sc(6.0))))
             .push(grid_controls)
-            .push(Space::with_height(Length::Fixed(8.0)))
+            .push(Space::with_height(Length::Fixed(sc(6.0))))
             .push(y_row)
-            .push(Space::with_height(Length::Fixed(4.0)))
-            .push(scrollable(grid_col))
-            .push(Space::with_height(Length::Fixed(4.0)))
+            .push(Space::with_height(Length::Fixed(sc(4.0))))
+            .push(grid_col)
+            .push(Space::with_height(Length::Fixed(sc(4.0))))
             .push(rotate_row)
-            .push(Space::with_height(Length::Fixed(4.0)))
+            .push(Space::with_height(Length::Fixed(sc(4.0))))
             .push(legend)
-            .push(Space::with_height(Length::Fixed(8.0)))
+            .push(Space::with_height(Length::Fixed(sc(6.0))))
             .push(all_rotations_row)
-            .push(Space::with_height(Length::Fixed(8.0)))
+            .push(Space::with_height(Length::Fixed(sc(6.0))))
             // .push(horizontal_rule(1))
             // .push(Space::with_height(Length::Fixed(12.0)))
             .push(
@@ -1397,9 +1458,9 @@ impl Application for App {
                     .width(Length::Fill)
                     .center_x()
             )
-            .push(Space::with_height(Length::Fixed(12.0)))
-            .push(container(status_msg).width(Length::Fill).padding([10, 14]));
+            .push(Space::with_height(Length::Fixed(sc(8.0))))
+            .push(container(status_msg).width(Length::Fill).padding([sc(8.0) as u16, sc(14.0) as u16]));
 
-        container(content).width(Length::Fill).height(Length::Fill).center_x().into()
+        container(scrollable(content)).width(Length::Fill).height(Length::Fill).center_x().into()
     }
 }

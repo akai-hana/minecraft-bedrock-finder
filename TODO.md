@@ -3,7 +3,6 @@
 
 # UI
 - Add click-and-drag horizontal bars to the grid dimensions
-- Add an option that, when enabled, searches the same pattern but on all 4 rotations for each step taken on the spiral
 
 ---
 
