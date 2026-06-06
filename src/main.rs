@@ -5,7 +5,6 @@
 /// Example: bedrockformation 124352345 0:0 floor 0,-63,0:1 1,-62,0:1 0,-63,1:0
 
 use std::env;
-use rayon::prelude::*;
 
 // Constants 
 
@@ -35,8 +34,8 @@ impl BedrockType {
             BedrockType::Roof  => "minecraft:bedrock_roof",
         }
     }
-    fn min(self) -> i32 { match self { BedrockType::Floor => -64, BedrockType::Roof => 122 } }
-    fn max(self) -> i32 { match self { BedrockType::Floor => -59, BedrockType::Roof => 127 } }
+    fn min(self) -> i32 { match self { BedrockType::Floor => -64, BedrockType::Roof => 128 } }
+    fn max(self) -> i32 { match self { BedrockType::Floor => -59, BedrockType::Roof => 123 } }
 }
 
 // Xoroshiro128++ RNG (mirrors Xoroshiro128PlusPlusRandomImpl) 
@@ -89,8 +88,8 @@ fn math_hash(x: i32, y: i32, z: i32) -> i64 {
     let term_z = (z as i64).wrapping_mul(116_129_781_i64);
     let mut l = term_x ^ term_z ^ (y as i64);
     l = l.wrapping_mul(l)
-         .wrapping_mul(42_317_861_i64)
-         .wrapping_add(l.wrapping_mul(11_i64));
+        .wrapping_mul(42_317_861_i64)
+        .wrapping_add(l.wrapping_mul(11_i64));
     l >> 16
 }
 
@@ -133,9 +132,10 @@ fn compute_probability(y: i32, bt: BedrockType) -> f64 {
             else { 1.0 - (y - min) as f64 / (max - min) as f64 }
         }
         BedrockType::Roof => {
-            if y == max     { 2.0 }
-            else if y < min { -1.0 }
-            else { 1.0 - (max - y) as f64 / (max - min) as f64 }
+            if y == min     { 2.0 }
+            else if y < max { -1.0 }
+            else { 1.0 - (y - max) as f64 / (min - max) as f64 }
+            // = 1 - (y - 123) / 5
         }
     }
 }
@@ -315,9 +315,21 @@ mod simd_avx2 {
         let l_11   = mullo_epi64(l,    _mm256_set1_epi64x(11_i64));
         l = _mm256_add_epi64(l_sq_k, l_11);
 
-        // l >> 16 (logical sign is irrelevant; result is immediately XORd
-        // with dlo and reinterpreted as u64 in the caller)
-        _mm256_srli_epi64(l, 16)
+        // l >> 16 (arithmetic / signed).  MUST match the scalar `l >> 16` on i64.
+        // When l is negative the top 16 bits are 0xFFFF, not 0x0000; using srli
+        // (logical) here produces a wrong hash for any negative l.
+        // AVX2 has no _mm256_srai_epi64, so we emulate it:
+        //   arithmetic_sra(x, 16) = srli(x, 16) | (sign_mask & 0xFFFF000000000000)
+        // where sign_mask is all-ones in lanes where x < 0, all-zeros otherwise.
+        {
+            let logical   = _mm256_srli_epi64(l, 16);
+            let sign_mask = _mm256_cmpgt_epi64(_mm256_setzero_si256(), l);
+            let top16     = _mm256_and_si256(
+                                sign_mask,
+                                _mm256_set1_epi64x(0xFFFF_0000_0000_0000_u64 as i64),
+                            );
+            _mm256_or_si256(logical, top16)
+        }
     }
 
     /// Returns a 4-bit mask: bit `i` is set if position `i` passes the
@@ -480,7 +492,9 @@ mod simd_avx512 {
         let l_11   = _mm512_mullo_epi64(l,    _mm512_set1_epi64(11_i64));
         l = _mm512_add_epi64(l_sq_k, l_11);
 
-        _mm512_srli_epi64(l, 16)
+        // l >> 16 (arithmetic / signed).  MUST match the scalar `l >> 16` on i64.
+        // AVX-512F provides _mm512_srai_epi64 natively; no emulation needed.
+        _mm512_srai_epi64(l, 16)
     }
 
     /// Returns an 8-bit mask: bit `i` is set if position `i` passes the
@@ -609,54 +623,54 @@ fn detect_simd() -> SimdLevel {
 // match in spiral order.
 
 fn search_chunk(chunk: &[(i32, i32)], dlo: i64, dhi: i64, blocks: &[Block], simd: SimdLevel) -> Option<usize> {
+    // All paths iterate sequentially over groups to guarantee spiral order.
+    // SIMD kernels provide fast per-group candidate screening; the scalar
+    // check_formation confirms the exact position within a matching group.
+
     #[cfg(target_arch = "x86_64")]
     if simd == SimdLevel::Avx512 {
         let n_groups = chunk.len() / 8;
-        let found_group = (0..n_groups).into_par_iter().find_first(|&g| {
+        for g in 0..n_groups {
             let start = g * 8;
             // SAFETY: AVX-512F+DQ verified by detect_simd; slice is exactly 8 elements.
-            unsafe {
-                simd_avx512::check_formation_x8(
-                    &chunk[start..start + 8], dlo, dhi, blocks,
-                ) != 0
-            }
-        });
-        return found_group.and_then(|g| {
-            let start = g * 8;
-            (0..8)
-                .find(|&j| {
+            let mask = unsafe {
+                simd_avx512::check_formation_x8(&chunk[start..start + 8], dlo, dhi, blocks)
+            };
+            if mask != 0 {
+                for j in 0..8 {
                     let (cx, cz) = chunk[start + j];
-                    check_formation(cx, cz, dlo, dhi, blocks)
-                })
-                .map(|j| start + j)
-        });
+                    if check_formation(cx, cz, dlo, dhi, blocks) {
+                        return Some(start + j);
+                    }
+                }
+            }
+        }
+        return None;
     }
 
     #[cfg(target_arch = "x86_64")]
     if simd == SimdLevel::Avx2 {
         let n_groups = chunk.len() / 4;
-        let found_group = (0..n_groups).into_par_iter().find_first(|&g| {
+        for g in 0..n_groups {
             let start = g * 4;
             // SAFETY: AVX2 verified by detect_simd; slice is exactly 4 elements.
-            unsafe {
-                simd_avx2::check_formation_x4(
-                    &chunk[start..start + 4], dlo, dhi, blocks,
-                ) != 0
-            }
-        });
-        return found_group.and_then(|g| {
-            let start = g * 4;
-            (0..4)
-                .find(|&j| {
+            let mask = unsafe {
+                simd_avx2::check_formation_x4(&chunk[start..start + 4], dlo, dhi, blocks)
+            };
+            if mask != 0 {
+                for j in 0..4 {
                     let (cx, cz) = chunk[start + j];
-                    check_formation(cx, cz, dlo, dhi, blocks)
-                })
-                .map(|j| start + j)
-        });
+                    if check_formation(cx, cz, dlo, dhi, blocks) {
+                        return Some(start + j);
+                    }
+                }
+            }
+        }
+        return None;
     }
 
-    // Scalar fallback: non-AVX2/AVX-512 x86-64 or non-x86-64 architectures.
-    (0..chunk.len()).into_par_iter().find_first(|&i| {
+    // Scalar fallback: sequential to guarantee spiral order.
+    (0..chunk.len()).find(|&i| {
         let (cx, cz) = chunk[i];
         check_formation(cx, cz, dlo, dhi, blocks)
     })
@@ -717,7 +731,7 @@ fn main() {
             eprintln!(
                 "Error: block ({},{},{}) is always bedrock but declared as air.\
                  No solution exists.",
-                b.x, b.y, b.z
+                 b.x, b.y, b.z
             );
             std::process::exit(1);
         }
@@ -725,7 +739,7 @@ fn main() {
             eprintln!(
                 "Error: block ({},{},{}) is never bedrock but declared as bedrock.\
                  No solution exists.",
-                b.x, b.y, b.z
+                 b.x, b.y, b.z
             );
             std::process::exit(1);
         }
@@ -786,29 +800,22 @@ fn main() {
     let mut x   = start_x;
     let mut z   = start_z;
     let mut dir = Dir::Right;
-    let mut steps_to_take:           i32 = 1;
-    let mut steps_taken:             i32 = 0;
+    let mut steps_to_take: i32 = 1;
+    let mut steps_taken: i32 = 0;
     let mut sides_until_incremental: i32 = 0;
 
     let mut chunk = vec![(0i32, 0i32); CHUNK_SIZE];
 
     loop {
         for slot in chunk.iter_mut() {
-            // 1. Record the current valid coordinate pair
             *slot = (x, z);
-
-            // 2. Take the physical step in the current direction
             dir.step(&mut x, &mut z);
             steps_taken += 1;
-
-            // 3. Check if we finished the current segment length
             if steps_taken == steps_to_take {
                 steps_taken = 0;
                 dir = dir.next();
                 sides_until_incremental += 1;
-
-                // Every 2 sides completed, increase the segment length by 1
-                if sides_until_incremental == 2 {
+                if sides_until_incremental > 2 { // fire every 3 turns
                     sides_until_incremental = 0;
                     steps_to_take += 1;
                 }
