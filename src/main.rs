@@ -9,7 +9,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use iced::{
     Application, Command, Element, Length, Settings, Theme, Alignment,
     executor, theme,
-    widget::{button, checkbox, container, horizontal_rule, radio, row, scrollable, text, text_input, Column, Row, Space},
+    widget::{button, checkbox, container, horizontal_rule, mouse_area, radio, row, scrollable, text, text_input, Column, Row, Space},
     window,
 };
 
@@ -919,19 +919,28 @@ impl CellState {
             CellState::Bedrock    => CellState::Unknown,
         }
     }
-}
-
-/// The six Y values that can contain bedrock for each layer type.
-fn y_values(bt: BedrockType) -> [i32; 6] {
-    match bt {
-        BedrockType::Floor => [-64, -63, -62, -61, -60, -59],
-        BedrockType::Roof  => [128, 127, 126, 125, 124, 123],
+    fn prev(self) -> Self {
+        match self {
+            CellState::Unknown    => CellState::Bedrock,
+            CellState::NonBedrock => CellState::Unknown,
+            CellState::Bedrock    => CellState::NonBedrock,
+        }
     }
 }
 
-/// Allocate a fresh 6-layer * rows * cols grid, all Unknown.
+/// The four Y values that can contain probabilistic bedrock for each layer type.
+/// Ordered left-to-right on the tab strip: most-air end first (-60 … -63 for floor).
+/// -64 (always bedrock) and -59 (always air) are excluded as redundant.
+fn y_values(bt: BedrockType) -> [i32; 4] {
+    match bt {
+        BedrockType::Floor => [-60, -61, -62, -63],
+        BedrockType::Roof  => [124, 125, 126, 127],
+    }
+}
+
+/// Allocate a fresh 4-layer * rows * cols grid, all Unknown.
 fn make_grid(rows: usize, cols: usize) -> Vec<Vec<Vec<CellState>>> {
-    vec![vec![vec![CellState::Unknown; cols]; rows]; 6]
+    vec![vec![vec![CellState::Unknown; cols]; rows]; 4]
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -958,7 +967,7 @@ struct App {
     // Top-left corner offset (relative block coords)
     grid_offset_x: String,
     grid_offset_z: String,
-    // [y_layer 0..6][row 0..grid_rows][col 0..grid_cols]
+    // [y_layer 0..4][row 0..grid_rows][col 0..grid_cols]
     grid_cells:          Vec<Vec<Vec<CellState>>>,
     /// When true the search tests all 4 rotations of the pattern at every
     /// candidate position, so the result is found regardless of which
@@ -1005,6 +1014,8 @@ enum Message {
     GridOffsetZChanged(String),
     /// Cycle the state of cell (row, col) in the active Y-layer.
     GridCellClicked(usize, usize),
+    /// Cycle the state of cell (row, col) in reverse (right-click).
+    GridCellRightClicked(usize, usize),
     /// Rotate all Y-layers 90º clockwise (X->Z, Z->−X).
     RotateCW,
     /// Rotate all Y-layers 90º counter-clockwise (X->−Z, Z->X).
@@ -1075,6 +1086,11 @@ impl Application for App {
             Message::GridCellClicked(r, c) => {
                 self.grid_cells[self.grid_y_idx][r][c] =
                     self.grid_cells[self.grid_y_idx][r][c].next();
+                Command::none()
+            }
+            Message::GridCellRightClicked(r, c) => {
+                self.grid_cells[self.grid_y_idx][r][c] =
+                    self.grid_cells[self.grid_y_idx][r][c].prev();
                 Command::none()
             }
 
@@ -1281,18 +1297,20 @@ impl Application for App {
                     CellState::NonBedrock => ("O", theme::Button::Primary),
                     CellState::Bedrock    => ("X", theme::Button::Destructive),
                 };
-                let cell = button(
-                        container(text(label).size(15))
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .center_x()
-                            .center_y()
-                    )
-                    .on_press(Message::GridCellClicked(row_idx, col_idx))
-                    .style(style)
-                    .width(Length::Fixed(30.0))
-                    .height(Length::Fixed(30.0))
-                    .padding(0);
+                let cell = mouse_area(
+                    button(
+                            container(text(label).size(15))
+                                .width(Length::Fill)
+                                .height(Length::Fill)
+                                .center_x()
+                                .center_y()
+                        )
+                        .on_press(Message::GridCellClicked(row_idx, col_idx))
+                        .style(style)
+                        .width(Length::Fixed(30.0))
+                        .height(Length::Fixed(30.0))
+                        .padding(0)
+                ).on_right_press(Message::GridCellRightClicked(row_idx, col_idx));
                 grid_row = grid_row.push(cell);
             }
             grid_col = grid_col.push(grid_row);
@@ -1322,7 +1340,7 @@ impl Application for App {
 
         let all_rotations_row = row![
             checkbox(
-                "Search all 4 possible rotations (if north direction is unknown)",
+                "Search all 4 rotations (if north direction is unknown)",
                 self.search_all_rotations,
             ).on_toggle(Message::ToggleAllRotations).text_size(13),
         ].align_items(Alignment::Center);
