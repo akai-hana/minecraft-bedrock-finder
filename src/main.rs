@@ -4,7 +4,14 @@
 /// Usage: bedrockformation <seed> <x:z> <floor|roof> [x,y,z:bedrock ...]
 /// Example: bedrockformation 124352345 0:0 floor 0,-63,0:1 1,-62,0:1 0,-63,1:0
 
-use std::env;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+use iced::{
+    Application, Command, Element, Length, Settings, Theme, Alignment,
+    executor, theme,
+    widget::{button, checkbox, container, horizontal_rule, radio, row, scrollable, text, text_input, Column, Row, Space},
+    window,
+};
 
 // Constants 
 
@@ -25,7 +32,7 @@ const _: () = assert!(CHUNK_SIZE % 8 == 0, "CHUNK_SIZE must be a multiple of 8 (
 
 // Bedrock type 
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BedrockType { Floor, Roof }
 
 impl BedrockType {
@@ -51,7 +58,6 @@ fn xoroshiro_next(s: &mut (u64, u64)) -> u64 {
     result
 }
 
-// Issue 6: mark #[inline(always)] so is_bedrock calls this instead of reimplementing it.
 #[inline(always)]
 fn guard_zero(state: (u64, u64)) -> (u64, u64) {
     if (state.0 | state.1) == 0 { (FALLBACK_LO, FALLBACK_HI) } else { state }
@@ -112,7 +118,6 @@ fn is_bedrock(dlo: i64, dhi: i64, x: i32, y: i32, z: i32, probability: f64) -> b
     let s0 = (hash ^ dlo) as u64;
     let s1 = dhi as u64;
 
-    // Issue 6: use guard_zero instead of reimplementing inline.
     let (s0, s1) = guard_zero((s0, s1));
 
     // Single xoroshiro128++ step (read-only, no state struct needed)
@@ -447,7 +452,7 @@ mod simd_avx2 {
 // - cvtepi64->32 _mm512_cvtepi64_epi32 packs 8 * i64 -> 8 * i32 in one instruction,
 //               replacing the pack_lo32 permute.
 //
-// - guard_zero  Omitted (same reasoning as AVX2; see issue-3 comment there).
+// - guard_zero  Omitted (same reasoning as AVX2).
 //
 // On Ice Lake / Zen 4 and newer this is a theoretical 2* throughput improvement
 // over the AVX2 path for the inner kernel.
@@ -697,107 +702,174 @@ impl Dir {
     }
 }
 
-// main 
+// main
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+fn main() -> iced::Result {
+    App::run(Settings {
+        window: window::Settings {
+            size: iced::Size::new(820.0, 720.0),
+            min_size: Some(iced::Size::new(680.0, 560.0)),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
 
-    if args.len() < 4 {
-        eprintln!("Usage: bedrockformation <seed> <x:z> <floor|roof> [x,y,z:bedrock ...]");
-        eprintln!("Example: bedrockformation 124352345 0:0 floor 0,-63,0:1 1,-62,0:1 0,-63,1:0");
-        std::process::exit(1);
-    }
+// Block-level rotation helpers
 
-    let seed: i64 = args[1].parse().expect("seed must be a long integer");
-    let xz: Vec<&str> = args[2].split(':').collect();
-    let start_x: i32  = xz[0].parse().expect("invalid center x");
-    let start_z: i32  = xz[1].parse().expect("invalid center z");
-    let bt = if args[3] == "roof" { BedrockType::Roof } else { BedrockType::Floor };
-
-    let mut blocks: Vec<Block> = args[4..].iter().map(|arg| {
-        let halves: Vec<&str> = arg.splitn(2, ':').collect();
-        let xyz: Vec<i32> = halves[0].split(',').map(|s| s.parse().unwrap()).collect();
-        let should_be_bedrock = halves[1].parse::<i32>().unwrap() == 1;
-        let probability = compute_probability(xyz[1], bt);
-        Block { x: xyz[0], y: xyz[1], z: xyz[2], should_be_bedrock, probability }
+/// Rotate a set of relative block offsets by `times_cw` quarter-turns clockwise,
+/// then normalise so the minimum X and Z coordinates are both 0.
+///
+/// Rotation formulae (standard 2-D, with X east and Z south):
+///   0º -> (x,  z)
+///   1* CW  ->  (−z,  x)
+///   2* CW  ->  (−x, −z)
+///   3* CW  ->  ( z, −x)
+fn rotate_blocks(blocks: &[Block], times_cw: u8) -> Vec<Block> {
+    if blocks.is_empty() { return vec![]; }
+    let transformed: Vec<(i32, i32)> = blocks.iter().map(|b| {
+        match times_cw % 4 {
+            0 => ( b.x,  b.z),
+            1 => (-b.z,  b.x),
+            2 => (-b.x, -b.z),
+            3 => ( b.z, -b.x),
+            _ => unreachable!(),
+        }
     }).collect();
+    let min_x = transformed.iter().map(|&(x, _)| x).min().unwrap();
+    let min_z = transformed.iter().map(|&(_, z)| z).min().unwrap();
+    blocks.iter().zip(transformed.iter()).map(|(b, &(tx, tz))| Block {
+        x: tx - min_x,
+        z: tz - min_z,
+        y: b.y,
+        should_be_bedrock: b.should_be_bedrock,
+        probability: b.probability,
+    }).collect()
+}
 
-    if blocks.is_empty() { return; }
+/// Canonical signature for deduplication: sorted list of (x, y, z, is_bedrock).
+fn blocks_signature(blocks: &[Block]) -> Vec<(i32, i32, i32, bool)> {
+    let mut sig: Vec<_> = blocks
+        .iter()
+        .map(|b| (b.x, b.y, b.z, b.should_be_bedrock))
+        .collect();
+    sig.sort_unstable();
+    sig
+}
 
-    // Detect impossible constraints up front so we fail fast instead of looping forever
-    for b in &blocks {
-        let always_bedrock = b.probability >= 1.0;
-        let never_bedrock  = b.probability <= 0.0;
-        if always_bedrock && !b.should_be_bedrock {
-            eprintln!(
-                "Error: block ({},{},{}) is always bedrock but declared as air. \
-                 No solution exists.",
-                 b.x, b.y, b.z
-            );
-            std::process::exit(1);
+/// Return up to 4 distinct rotations of `blocks` (fewer if the pattern has
+/// rotational symmetry, e.g. a symmetric 2-rotation pattern yields only 2).
+fn generate_rotations(blocks: Vec<Block>) -> Vec<Vec<Block>> {
+    let mut rotations: Vec<Vec<Block>> = Vec::with_capacity(4);
+    let mut seen: Vec<Vec<(i32, i32, i32, bool)>> = Vec::with_capacity(4);
+    for r in 0..4u8 {
+        let rotated = rotate_blocks(&blocks, r);
+        let sig = blocks_signature(&rotated);
+        if !seen.contains(&sig) {
+            seen.push(sig);
+            rotations.push(rotated);
         }
-        if never_bedrock && b.should_be_bedrock {
-            eprintln!(
-                "Error: block ({},{},{}) is never bedrock but declared as bedrock. \
-                 No solution exists.",
-                 b.x, b.y, b.z
-            );
-            std::process::exit(1);
+    }
+    rotations
+}
+
+// Grid rotation helpers
+
+/// Rotate all Y-layers 90º clockwise.
+/// In the grid, col maps to X and row maps to Z, so CW means: new_col = rows−1−row, new_row = col.
+/// The resulting grid has new_rows = old_cols, new_cols = old_rows.
+fn rotate_grid_cw(
+    cells: &[Vec<Vec<CellState>>],
+    rows: usize,
+    cols: usize,
+) -> (Vec<Vec<Vec<CellState>>>, usize, usize) {
+    let new_rows = cols;
+    let new_cols = rows;
+    let new_cells = cells
+        .iter()
+        .map(|layer| {
+            let mut new_layer = vec![vec![CellState::Unknown; new_cols]; new_rows];
+            for r in 0..rows {
+                for c in 0..cols {
+                    // CW: (r, c) -> new position (c, rows−1−r)
+                    new_layer[c][rows - 1 - r] = layer[r][c];
+                }
+            }
+            new_layer
+        })
+        .collect();
+    (new_cells, new_rows, new_cols)
+}
+
+/// Rotate all Y-layers 90º counter-clockwise.
+/// CCW: (r, c) -> new position (cols−1−c, r).
+/// The resulting grid has new_rows = old_cols, new_cols = old_rows.
+fn rotate_grid_ccw(
+    cells: &[Vec<Vec<CellState>>],
+    rows: usize,
+    cols: usize,
+) -> (Vec<Vec<Vec<CellState>>>, usize, usize) {
+    let new_rows = cols;
+    let new_cols = rows;
+    let new_cells = cells
+        .iter()
+        .map(|layer| {
+            let mut new_layer = vec![vec![CellState::Unknown; new_cols]; new_rows];
+            for r in 0..rows {
+                for c in 0..cols {
+                    // CCW: (r, c) -> new position (cols−1−c, r)
+                    new_layer[cols - 1 - c][r] = layer[r][c];
+                }
+            }
+            new_layer
+        })
+        .collect();
+    (new_cells, new_rows, new_cols)
+}
+
+// GUI - search runner
+
+// Wraps the original spiral search loop with a cancellation flag checked once
+// per chunk.  Returns Ok(Some((x, z))) on success, Ok(None) if cancelled, or
+// Err if the block constraints are impossible.
+fn run_search(
+    seed: i64,
+    start_x: i32,
+    start_z: i32,
+    bt: BedrockType,
+    mut blocks: Vec<Block>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Option<(i32, i32)>, String> {
+    if blocks.is_empty() { return Ok(Some((start_x, start_z))); }
+
+    for b in &blocks {
+        if b.probability >= 1.0 && !b.should_be_bedrock {
+            return Err(format!(
+                "Block ({},{},{}) is always bedrock but declared as air. No solution exists.",
+                b.x, b.y, b.z));
+        }
+        if b.probability <= 0.0 && b.should_be_bedrock {
+            return Err(format!(
+                "Block ({},{},{}) is never bedrock but declared as bedrock. No solution exists.",
+                b.x, b.y, b.z));
         }
     }
 
-    // Sort by descending mismatch probability (most-likely-to-reject first) so
-    // check_formation short-circuits as early as possible.
-    // sort_by_cached_key computes each key exactly once (no recompute per comparison,
-    // no intermediate Vec). Casting to bits is safe: all keys are finite non-negative
-    // f64, so IEEE bit order matches numeric order; Reverse makes it descending.
     blocks.sort_by_cached_key(|b| {
         let key = if b.should_be_bedrock { 1.0 - clamp01(b.probability) } else { clamp01(b.probability) };
         std::cmp::Reverse(key.to_bits())
     });
 
-    // Issue 3: Strip trivially-informationless blocks after sorting.
-    // Blocks where the outcome is guaranteed (always-bedrock declared as bedrock,
-    // or never-bedrock declared as air) always pass their check and contribute
-    // nothing to candidate rejection. Removing them avoids iterating over them
-    // on every single candidate.
     let blocks: Vec<Block> = blocks.into_iter().filter(|b| {
         let p = clamp01(b.probability);
         if b.should_be_bedrock { p < 1.0 } else { p > 0.0 }
     }).collect();
 
-    if blocks.is_empty() {
-        // Every block was trivially guaranteed, so every coordinate matches.
-        println!("Found Bedrock Formation at X:{} Z:{}", start_x, start_z);
-        return;
-    }
-
-    for b in &blocks {
-        println!("BedrockBlock{{x={}, y={}, z={}, shouldBeBedrock={}, p={:.3}}}",
-            b.x, b.y, b.z, b.should_be_bedrock, clamp01(b.probability));
-    }
+    if blocks.is_empty() { return Ok(Some((start_x, start_z))); }
 
     let (dlo, dhi) = compute_deriver_seeds(seed, bt);
+    let simd       = detect_simd();
 
-    // Detect the widest available SIMD level once here rather than on every
-    // call to search_chunk.  std's is_x86_feature_detected! caches the result
-    // in an atomic, but it still costs a function call + memory load + branch
-    // that the compiler can't eliminate.  Hoisting gives a trivially-predictable
-    // branch (always the same value) and makes the dispatch point explicit.
-    let simd = detect_simd();
-
-    // Spiral search
-    // Fill a chunk buffer, then TODO: search it in parallel with rayon.
-    //
-    // rayon::find_first guarantees the earliest (spiral-order) match, automatically
-    // cancels other workers once a match is found, and never wastes threads on
-    // empty ranges. No manual pool, no Vec copies, no mpsc plumbing needed.
-    //
-    // AoS layout: one Vec<(i32,i32)> keeps each position's x and z adjacent
-    // so rayon workers traverse a single contiguous allocation.
-    //
-    // search_chunk dispatches to the AVX2 SIMD path (groups of 4) when available,
-    // falling back to the scalar path otherwise.
     let mut x   = start_x;
     let mut z   = start_z;
     let mut dir = Dir::Right;
@@ -808,6 +880,8 @@ fn main() {
     let mut chunk = vec![(0i32, 0i32); CHUNK_SIZE];
 
     loop {
+        if cancel.load(Ordering::Relaxed) { return Ok(None); }
+
         for slot in chunk.iter_mut() {
             *slot = (x, z);
             dir.step(&mut x, &mut z);
@@ -825,8 +899,489 @@ fn main() {
 
         if let Some(idx) = search_chunk(&chunk, dlo, dhi, &blocks, simd) {
             let (cx, cz) = chunk[idx];
-            println!("Found Bedrock Formation at X:{} Z:{}", cx, cz);
-            break;
+            return Ok(Some((cx, cz)));
         }
+    }
+}
+
+// GUI - types
+
+/// State of one cell in the constraint grid.
+/// Cycles Unknown -> NonBedrock -> Bedrock -> Unknown on each click.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum CellState { #[default] Unknown, NonBedrock, Bedrock }
+
+impl CellState {
+    fn next(self) -> Self {
+        match self {
+            CellState::Unknown    => CellState::NonBedrock,
+            CellState::NonBedrock => CellState::Bedrock,
+            CellState::Bedrock    => CellState::Unknown,
+        }
+    }
+}
+
+/// The six Y values that can contain bedrock for each layer type.
+fn y_values(bt: BedrockType) -> [i32; 6] {
+    match bt {
+        BedrockType::Floor => [-64, -63, -62, -61, -60, -59],
+        BedrockType::Roof  => [128, 127, 126, 125, 124, 123],
+    }
+}
+
+/// Allocate a fresh 6-layer * rows * cols grid, all Unknown.
+fn make_grid(rows: usize, cols: usize) -> Vec<Vec<Vec<CellState>>> {
+    vec![vec![vec![CellState::Unknown; cols]; rows]; 6]
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SearchStatus {
+    Idle,
+    Searching,
+    Cancelled,
+    Found(i32, i32),
+    Error(String),
+}
+
+struct App {
+    seed:          String,
+    center_x:      String,
+    center_z:      String,
+    bedrock_type:  BedrockType,
+    // Grid dimensions (1–16 each)
+    grid_cols:     usize,
+    grid_rows:     usize,
+    grid_cols_str: String,
+    grid_rows_str: String,
+    // Which Y-layer tab is active
+    grid_y_idx:    usize,
+    // Top-left corner offset (relative block coords)
+    grid_offset_x: String,
+    grid_offset_z: String,
+    // [y_layer 0..6][row 0..grid_rows][col 0..grid_cols]
+    grid_cells:          Vec<Vec<Vec<CellState>>>,
+    /// When true the search tests all 4 rotations of the pattern at every
+    /// candidate position, so the result is found regardless of which
+    /// compass direction the user was facing when they captured the pattern.
+    search_all_rotations: bool,
+    status:        SearchStatus,
+    cancel_flag:   Option<Arc<AtomicBool>>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        let cols = 8usize;
+        let rows = 8usize;
+        Self {
+            seed:          String::new(),
+            center_x:      "0".into(),
+            center_z:      "0".into(),
+            bedrock_type:  BedrockType::Floor,
+            grid_cols:     cols,
+            grid_rows:     rows,
+            grid_cols_str: cols.to_string(),
+            grid_rows_str: rows.to_string(),
+            grid_y_idx:    0,
+            grid_offset_x: "0".into(),
+            grid_offset_z: "0".into(),
+            grid_cells:          make_grid(rows, cols),
+            search_all_rotations: false,
+            status:        SearchStatus::Idle,
+            cancel_flag:   None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    SeedChanged(String),
+    CenterXChanged(String),
+    CenterZChanged(String),
+    TypeChanged(BedrockType),
+    GridColsChanged(String),
+    GridRowsChanged(String),
+    GridYChanged(usize),
+    GridOffsetXChanged(String),
+    GridOffsetZChanged(String),
+    /// Cycle the state of cell (row, col) in the active Y-layer.
+    GridCellClicked(usize, usize),
+    /// Rotate all Y-layers 90º clockwise (X->Z, Z->−X).
+    RotateCW,
+    /// Rotate all Y-layers 90º counter-clockwise (X->−Z, Z->X).
+    RotateCCW,
+    /// Toggle whether the search tries all 4 rotations of the pattern.
+    ToggleAllRotations(bool),
+    Search,
+    Cancel,
+    SearchDone(Result<Option<(i32, i32)>, String>),
+}
+
+// GUI - Application impl
+
+impl Application for App {
+    type Message = Message;
+    type Theme   = Theme;
+    type Executor = executor::Default;
+    type Flags   = ();
+
+    fn new(_flags: ()) -> (Self, Command<Message>) {
+        (App::default(), Command::none())
+    }
+
+    fn title(&self) -> String { String::from("Bedrock Formation Finder") }
+
+    fn theme(&self) -> Theme { Theme::GruvboxDark }
+
+    fn update(&mut self, message: Message) -> Command<Message> {
+        match message {
+            Message::SeedChanged(s)    => { self.seed     = s; Command::none() }
+            Message::CenterXChanged(s) => { self.center_x = s; Command::none() }
+            Message::CenterZChanged(s) => { self.center_z = s; Command::none() }
+            Message::TypeChanged(t) => {
+                // Y values change between floor/roof, so reset the grid.
+                self.bedrock_type = t;
+                self.grid_cells   = make_grid(self.grid_rows, self.grid_cols);
+                self.grid_y_idx   = 0;
+                Command::none()
+            }
+
+            Message::GridColsChanged(s) => {
+                self.grid_cols_str = s.clone();
+                if let Ok(n) = s.parse::<usize>() {
+                    let n = n.clamp(1, 16);
+                    for layer in &mut self.grid_cells {
+                        for row in &mut *layer {
+                            row.resize(n, CellState::Unknown);
+                        }
+                    }
+                    self.grid_cols = n;
+                }
+                Command::none()
+            }
+            Message::GridRowsChanged(s) => {
+                self.grid_rows_str = s.clone();
+                if let Ok(n) = s.parse::<usize>() {
+                    let n = n.clamp(1, 16);
+                    for layer in &mut self.grid_cells {
+                        layer.resize(n, vec![CellState::Unknown; self.grid_cols]);
+                    }
+                    self.grid_rows = n;
+                }
+                Command::none()
+            }
+            Message::GridYChanged(idx)     => { self.grid_y_idx    = idx; Command::none() }
+            Message::GridOffsetXChanged(s) => { self.grid_offset_x = s;   Command::none() }
+            Message::GridOffsetZChanged(s) => { self.grid_offset_z = s;   Command::none() }
+            Message::GridCellClicked(r, c) => {
+                self.grid_cells[self.grid_y_idx][r][c] =
+                    self.grid_cells[self.grid_y_idx][r][c].next();
+                Command::none()
+            }
+
+            Message::RotateCW => {
+                let (new_cells, new_rows, new_cols) =
+                    rotate_grid_cw(&self.grid_cells, self.grid_rows, self.grid_cols);
+                self.grid_cells    = new_cells;
+                self.grid_rows     = new_rows;
+                self.grid_cols     = new_cols;
+                self.grid_rows_str = new_rows.to_string();
+                self.grid_cols_str = new_cols.to_string();
+                // Keep y-index in bounds (it always stays valid since we never
+                // change the number of Y-layers, just rows/cols).
+                Command::none()
+            }
+
+            Message::RotateCCW => {
+                let (new_cells, new_rows, new_cols) =
+                    rotate_grid_ccw(&self.grid_cells, self.grid_rows, self.grid_cols);
+                self.grid_cells    = new_cells;
+                self.grid_rows     = new_rows;
+                self.grid_cols     = new_cols;
+                self.grid_rows_str = new_rows.to_string();
+                self.grid_cols_str = new_cols.to_string();
+                Command::none()
+            }
+
+            Message::ToggleAllRotations(v) => {
+                self.search_all_rotations = v;
+                Command::none()
+            }
+
+            Message::Search => {
+                let seed = match self.seed.parse::<i64>() {
+                    Ok(s)  => s,
+                    Err(_) => { self.status = SearchStatus::Error("Seed must be a 64-bit integer".into()); return Command::none(); }
+                };
+                let start_x = match self.center_x.parse::<i32>() {
+                    Ok(v)  => v,
+                    Err(_) => { self.status = SearchStatus::Error("Invalid center X".into()); return Command::none(); }
+                };
+                let start_z = match self.center_z.parse::<i32>() {
+                    Ok(v)  => v,
+                    Err(_) => { self.status = SearchStatus::Error("Invalid center Z".into()); return Command::none(); }
+                };
+                let offset_x = self.grid_offset_x.parse::<i32>().unwrap_or(0);
+                let offset_z = self.grid_offset_z.parse::<i32>().unwrap_or(0);
+                let bt  = self.bedrock_type;
+                let ys  = y_values(bt);
+                let mut blocks_vec: Vec<Block> = Vec::new();
+                for (y_idx, &y) in ys.iter().enumerate() {
+                    for row in 0..self.grid_rows {
+                        for col in 0..self.grid_cols {
+                            let state = self.grid_cells[y_idx][row][col];
+                            if state == CellState::Unknown { continue; }
+                            blocks_vec.push(Block {
+                                x: offset_x + col as i32,
+                                y,
+                                z: offset_z + row as i32,
+                                should_be_bedrock: state == CellState::Bedrock,
+                                probability: compute_probability(y, bt),
+                            });
+                        }
+                    }
+                }
+                let all_rotations = self.search_all_rotations;
+                let cancel = Arc::new(AtomicBool::new(false));
+                self.cancel_flag = Some(cancel.clone());
+                self.status = SearchStatus::Searching;
+                Command::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            // Build the list of block-sets to search: either just
+                            // the entered pattern, or all 4 rotations of it.
+                            let rotations: Vec<Vec<Block>> = if all_rotations {
+                                generate_rotations(blocks_vec)
+                            } else {
+                                vec![blocks_vec]
+                            };
+                            // Try each rotation in turn; return the first hit (or
+                            // the last error/cancellation if none match).
+                            let mut last = Ok(None);
+                            for rot in rotations {
+                                last = run_search(seed, start_x, start_z, bt, rot, cancel.clone());
+                                match &last {
+                                    Ok(Some(_)) => return last, // found
+                                    Ok(None)    => return last, // cancelled
+                                    Err(_)      => {}           // impossible pattern, try next rotation
+                                }
+                            }
+                            last
+                        })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("Thread panic: {e}")))
+                    },
+                    Message::SearchDone,
+                )
+            }
+
+            Message::Cancel => {
+                if let Some(flag) = &self.cancel_flag { flag.store(true, Ordering::Relaxed); }
+                self.status = SearchStatus::Cancelled;
+                Command::none()
+            }
+
+            Message::SearchDone(result) => {
+                self.cancel_flag = None;
+                self.status = match result {
+                    Ok(Some((x, z))) => SearchStatus::Found(x, z),
+                    Ok(None)         => SearchStatus::Cancelled,
+                    Err(e)           => SearchStatus::Error(e),
+                };
+                Command::none()
+            }
+        }
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let is_searching = self.status == SearchStatus::Searching;
+
+        let seed_row = row![
+            text("World Seed").width(Length::Fixed(130.0)),
+            text_input("e.g. 124352345", &self.seed)
+                .on_input(Message::SeedChanged)
+                .width(Length::Fill)
+                .padding(8),
+        ].spacing(12).align_items(Alignment::Center);
+
+        let center_row = row![
+            text("Search Center").width(Length::Fixed(130.0)),
+            text("X"),
+            text_input("0", &self.center_x).on_input(Message::CenterXChanged).width(Length::Fixed(90.0)).padding(8),
+            text("Z"),
+            text_input("0", &self.center_z).on_input(Message::CenterZChanged).width(Length::Fixed(90.0)).padding(8),
+        ].spacing(10).align_items(Alignment::Center);
+
+        let type_row = row![
+            text("Bedrock Layer").width(Length::Fixed(130.0)),
+            radio("Floor (Y -64 to -59)", BedrockType::Floor, Some(self.bedrock_type), Message::TypeChanged),
+            Space::with_width(Length::Fixed(20.0)),
+            radio("Roof  (Y 123 to 128)", BedrockType::Roof,  Some(self.bedrock_type), Message::TypeChanged),
+        ].spacing(10).align_items(Alignment::Center);
+
+        // Grid size + offset controls
+        let grid_controls = row![
+            text("Grid Size").width(Length::Fixed(80.0)),
+            text("Cols"),
+            text_input("8", &self.grid_cols_str)
+                .on_input(Message::GridColsChanged)
+                .width(Length::Fixed(46.0))
+                .padding(7),
+            text("Rows"),
+            text_input("8", &self.grid_rows_str)
+                .on_input(Message::GridRowsChanged)
+                .width(Length::Fixed(46.0))
+                .padding(7),
+            Space::with_width(Length::Fixed(20.0)),
+            text("Offset").width(Length::Fixed(48.0)),
+            text("X"),
+            text_input("0", &self.grid_offset_x)
+                .on_input(Message::GridOffsetXChanged)
+                .width(Length::Fixed(58.0))
+                .padding(7),
+            text("Z"),
+            text_input("0", &self.grid_offset_z)
+                .on_input(Message::GridOffsetZChanged)
+                .width(Length::Fixed(58.0))
+                .padding(7),
+        ].spacing(8).align_items(Alignment::Center);
+
+        // Y-layer tab strip
+        // Tabs marked with * have at least one non-Unknown cell.
+        let ys = y_values(self.bedrock_type);
+        let mut y_row: Row<'_, Message> = Row::new()
+            .spacing(6)
+            .align_items(Alignment::Center)
+            .push(text("Y Layer").width(Length::Fixed(70.0)));
+        for (i, &y) in ys.iter().enumerate() {
+            let has_data = self.grid_cells[i].iter()
+                .any(|r| r.iter().any(|&c| c != CellState::Unknown));
+            let label = if has_data { format!("{}*", y) } else { y.to_string() };
+            let btn = if i == self.grid_y_idx {
+                // Active tab: no on_press so it is not re-clickable
+                button(text(label).size(13))
+                    .style(theme::Button::Primary)
+                    .padding([5, 10])
+            } else {
+                button(text(label).size(13))
+                    .style(theme::Button::Secondary)
+                    .on_press(Message::GridYChanged(i))
+                    .padding([5, 10])
+            };
+            y_row = y_row.push(btn);
+        }
+
+        // Cell grid
+        let mut grid_col: Column<'_, Message> = Column::new().spacing(2);
+        for row_idx in 0..self.grid_rows {
+            let mut grid_row: Row<'_, Message> = Row::new().spacing(2);
+            for col_idx in 0..self.grid_cols {
+                let state = self.grid_cells[self.grid_y_idx][row_idx][col_idx];
+                let (label, style) = match state {
+                    CellState::Unknown    => ("?", theme::Button::Secondary),
+                    CellState::NonBedrock => ("O", theme::Button::Primary),
+                    CellState::Bedrock    => ("X", theme::Button::Destructive),
+                };
+                let cell = button(
+                        container(text(label).size(15))
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .center_x()
+                            .center_y()
+                    )
+                    .on_press(Message::GridCellClicked(row_idx, col_idx))
+                    .style(style)
+                    .width(Length::Fixed(30.0))
+                    .height(Length::Fixed(30.0))
+                    .padding(0);
+                grid_row = grid_row.push(cell);
+            }
+            grid_col = grid_col.push(grid_row);
+        }
+
+        let rotate_row = row![
+            text("Rotate grid:").size(12).width(Length::Fixed(80.0)),
+            button(text("+90º (Clockwise)").size(13))
+                .on_press(Message::RotateCW)
+                .style(theme::Button::Secondary)
+                .padding([4, 10]),
+            button(text("−90º (Counter-clockwise)").size(13))
+                .on_press(Message::RotateCCW)
+                .style(theme::Button::Secondary)
+                .padding([4, 10]),
+        ].spacing(8).align_items(Alignment::Center);
+
+        let legend = row![
+            text("Click to cycle:").size(12),
+            Space::with_width(Length::Fixed(8.0)),
+            text("? Unknown").size(12),
+            Space::with_width(Length::Fixed(12.0)),
+            text("O Non-bedrock").size(12),
+            Space::with_width(Length::Fixed(12.0)),
+            text("X Bedrock").size(12),
+        ].align_items(Alignment::Center);
+
+        let all_rotations_row = row![
+            checkbox(
+                "Search all 4 possible rotations (if north direction is unknown)",
+                self.search_all_rotations,
+            ).on_toggle(Message::ToggleAllRotations).text_size(13),
+        ].align_items(Alignment::Center);
+
+        let search_btn = if is_searching {
+            button("Searching...").padding([10, 28])
+        } else {
+            button("Search").on_press(Message::Search).padding([10, 28])
+        };
+        let cancel_btn = if is_searching {
+            button("Cancel").on_press(Message::Cancel).padding([10, 20])
+        } else {
+            button("Cancel").padding([10, 20])
+        };
+
+        let status_msg = match &self.status {
+            SearchStatus::Idle        => text("Ready when you are."),
+            SearchStatus::Searching   => text("Looking for that juicy leaked stash..."),
+            SearchStatus::Cancelled   => text("Search cancelled. :("),
+            SearchStatus::Found(x, z) => text(format!("Found formation at X: {}   Z: {}", x, z)).size(18),
+            SearchStatus::Error(e)    => text(format!("Error: {}", e)),
+        };
+
+        let content = Column::new()
+            .spacing(2)
+            .padding(28)
+            .max_width(760)
+            .push(text("Bedrock Formation Finder").size(26))
+            .push(Space::with_height(Length::Fixed(4.0)))
+            .push(horizontal_rule(1))
+            .push(Space::with_height(Length::Fixed(8.0)))
+            .push(seed_row)
+            .push(center_row)
+            .push(type_row)
+            .push(Space::with_height(Length::Fixed(8.0)))
+            .push(horizontal_rule(1))
+            .push(Space::with_height(Length::Fixed(8.0)))
+            .push(grid_controls)
+            .push(Space::with_height(Length::Fixed(8.0)))
+            .push(y_row)
+            .push(Space::with_height(Length::Fixed(4.0)))
+            .push(scrollable(grid_col))
+            .push(Space::with_height(Length::Fixed(4.0)))
+            .push(rotate_row)
+            .push(Space::with_height(Length::Fixed(4.0)))
+            .push(legend)
+            .push(Space::with_height(Length::Fixed(8.0)))
+            .push(all_rotations_row)
+            .push(Space::with_height(Length::Fixed(8.0)))
+            // .push(horizontal_rule(1))
+            // .push(Space::with_height(Length::Fixed(12.0)))
+            .push(
+                container(row![search_btn, cancel_btn].spacing(16).align_items(Alignment::Center))
+                    .width(Length::Fill)
+                    .center_x()
+            )
+            .push(Space::with_height(Length::Fixed(12.0)))
+            .push(container(status_msg).width(Length::Fill).padding([10, 14]));
+
+        container(content).width(Length::Fill).height(Length::Fill).center_x().into()
     }
 }
