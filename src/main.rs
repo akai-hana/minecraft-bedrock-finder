@@ -21,6 +21,7 @@ const FALLBACK_HI: u64 = 7_640_891_576_956_012_809_u64;
 // improve throughput on cache-limited hardware while keeping rayon's find_first
 // effective.  The spiral-fill loop is cheap, so smaller chunks have little overhead.
 const CHUNK_SIZE: usize = 262_144;
+const _: () = assert!(CHUNK_SIZE % 8 == 0, "CHUNK_SIZE must be a multiple of 8 (AVX-512 requirement)");
 
 // Bedrock type 
 
@@ -729,7 +730,7 @@ fn main() {
         let never_bedrock  = b.probability <= 0.0;
         if always_bedrock && !b.should_be_bedrock {
             eprintln!(
-                "Error: block ({},{},{}) is always bedrock but declared as air.\
+                "Error: block ({},{},{}) is always bedrock but declared as air. \
                  No solution exists.",
                  b.x, b.y, b.z
             );
@@ -737,7 +738,7 @@ fn main() {
         }
         if never_bedrock && b.should_be_bedrock {
             eprintln!(
-                "Error: block ({},{},{}) is never bedrock but declared as bedrock.\
+                "Error: block ({},{},{}) is never bedrock but declared as bedrock. \
                  No solution exists.",
                  b.x, b.y, b.z
             );
@@ -786,7 +787,7 @@ fn main() {
     let simd = detect_simd();
 
     // Spiral search
-    // Fill a chunk buffer, then search it in parallel with rayon.
+    // Fill a chunk buffer, then TODO: search it in parallel with rayon.
     //
     // rayon::find_first guarantees the earliest (spiral-order) match, automatically
     // cancels other workers once a match is found, and never wastes threads on
@@ -815,7 +816,7 @@ fn main() {
                 steps_taken = 0;
                 dir = dir.next();
                 sides_until_incremental += 1;
-                if sides_until_incremental > 2 { // fire every 3 turns
+                if sides_until_incremental == 2 {
                     sides_until_incremental = 0;
                     steps_to_take += 1;
                 }
