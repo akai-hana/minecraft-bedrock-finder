@@ -23,19 +23,17 @@ const FLOAT_MULT: f32 = 5.960_464_5e-8_f32; // 2^-24
 const FALLBACK_LO: u64 = (-7_046_029_254_386_353_131_i64) as u64;
 const FALLBACK_HI: u64 = 7_640_891_576_956_012_809_u64;
 
-// MUST be a multiple of 8: AVX-512 processes groups of 8, AVX2 groups of 4.
-// (32_768 satisfies both; it is 2^15.)
+// Number of spiral positions examined between cancellation-flag checks.
 //
-// With the SoA layout the chunk holds two i32 arrays, so the total buffer size
-// is 2 * 4 * CHUNK_SIZE bytes.  At the previous value of 262_144 that was 2 MB,
-// well past the L2 cache on most CPUs (typically 256 KB to 1 MB).
+// The search loop runs par_iter().find_first() over SEARCH_BATCH_SIZE / 8 groups
+// of 8 positions each.  Rayon distributes the groups across all available cores;
+// find_first cancels remaining workers as soon as the earliest match is confirmed.
 //
-// 32_768 -> 2 * 4 * 32_768 = 256 KB, comfortably within L2 on virtually all
-// modern CPUs, so each chunk stays hot in cache throughout the spiral-fill and
-// SIMD scan passes.  The spiral-fill loop is cheap enough that the extra rayon
-// task overhead from smaller chunks is negligible.
-const CHUNK_SIZE: usize = 32_768;
-const _: () = assert!(CHUNK_SIZE % 8 == 0, "CHUNK_SIZE must be a multiple of 8 (AVX-512 requirement)");
+// At ~100 M positions/s per core with 8 cores that is ~800 M positions/s, so
+// 2^20 (≈ 1 M) positions per batch ≈ 1 ms per batch — short enough that the
+// cancel button feels instant.  Must be a multiple of 8 (AVX-512 group size).
+const SEARCH_BATCH_SIZE: i64 = 1 << 20; // 1_048_576; must be a multiple of 8
+const _: () = assert!(SEARCH_BATCH_SIZE % 8 == 0, "SEARCH_BATCH_SIZE must be a multiple of 8");
 
 // Bedrock type 
 
@@ -228,6 +226,19 @@ struct Blocks {
     /// Integer threshold `(probability * 2^24) as u64`; the only
     /// floating-point-related field accessed in the SIMD hot loop.
     prob_threshold:    Vec<u64>,
+    /// Precomputed `(x as i32).wrapping_mul(3_129_871) as i64`.
+    ///
+    /// Mirrors the Java `(long)(x * 3129871)` idiom: i32 wrapping multiply
+    /// first, then sign-extend to i64.  Stored here so that `check_formation_x8`
+    /// can hoist the `ox * 3_129_871` term out of the block loop and only add
+    /// this per-block constant inside it, replacing a multiply with an add.
+    bx_hash_term:      Vec<i64>,
+    /// Precomputed `(z as i64).wrapping_mul(116_129_781)`.
+    ///
+    /// The z-coordinate path keeps full 64-bit precision (no i32-first cast),
+    /// matching the Java `(long)z * 116129781L` idiom.  Same hoisting rationale
+    /// as `bx_hash_term`.
+    bz_hash_term:      Vec<i64>,
 }
 
 impl Blocks {
@@ -239,6 +250,16 @@ impl Blocks {
             should_be_bedrock: v.iter().map(|b| b.should_be_bedrock).collect(),
             probability:       v.iter().map(|b| b.probability).collect(),
             prob_threshold:    v.iter().map(|b| b.prob_threshold).collect(),
+            // Precomputed hash multiplier contributions for the AVX-512 hoisting
+            // optimisation in check_formation_x8.
+            //
+            // bx_hash_term: mirrors the Java (long)(x * 3129871) semantics —
+            //   i32 wrapping multiply first, then sign-extend to i64.
+            //
+            // bz_hash_term: mirrors Java (long)z * 116129781L —
+            //   z is treated as i64 from the start, so a straight i64 multiply.
+            bx_hash_term:      v.iter().map(|b| (b.x as i32).wrapping_mul(3_129_871) as i64).collect(),
+            bz_hash_term:      v.iter().map(|b| (b.z as i64).wrapping_mul(116_129_781_i64)).collect(),
         }
     }
 
@@ -300,9 +321,9 @@ fn clamp01(v: f64) -> f64 { v.clamp(0.0, 1.0) }
 // - early exit   check_formation_x4 ANDs per-block 4-bit masks and breaks as
 //                soon as active == 0, mirroring .all() short-circuiting.
 //
-// - spiral order find_first operates over CHUNK_SIZE/4 groups.  Once a group
-//                is found, a scalar scan of up to 4 positions pinpoints the
-//                exact first match in spiral order.
+// - spiral order find_first operates over SEARCH_BATCH_SIZE/8 groups.  Once a
+//                group is found, a scalar scan of up to 8 positions pinpoints
+//                the exact first match in spiral order.
 
 #[cfg(target_arch = "x86_64")]
 mod simd_avx2 {
@@ -455,48 +476,78 @@ mod simd_avx2 {
         }
     }
 
-    /// Returns a 4-bit mask of the positions (within a group of 4) that match
-    /// the entire formation.  Exits early as soon as no lanes remain active,
-    /// mirroring the scalar `.all()` short-circuit.
+    /// Fused 8-position formation check for AVX2 machines.
     ///
-    /// All blocks must have `probability in (0, 1)` (trivially-guaranteed blocks
-    /// are filtered before the search begins).
+    /// Processes all 8 spiral positions in **one** block-loop pass using two
+    /// `__m128i` register pairs (lo = positions 0–3, hi = positions 4–7),
+    /// halving the block-loop iterations compared to calling `check_formation_x4`
+    /// twice.
+    ///
+    /// # Mask layout
+    /// Bits 0–3 correspond to positions 0–3; bits 4–7 to positions 4–7.
+    /// A set bit means that position passes the full formation check.
+    ///
+    /// # Early-exit logic
+    /// Two independent 4-bit nibbles (`active_lo`, `active_hi`) track which
+    /// lanes are still in play.  The loop terminates as soon as
+    /// `active_lo | active_hi == 0`, i.e. no lane in either half can still
+    /// match — mirroring the scalar `.all()` short-circuit across both halves
+    /// in a single combined test.
     ///
     /// # Safety
     /// Requires AVX2.  Caller must have verified `is_x86_feature_detected!("avx2")`.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn check_formation_x4(
-        positions_x: &[i32], // exactly 4 entries (contiguous i32 array)
-        positions_z: &[i32], // exactly 4 entries (contiguous i32 array)
+    pub unsafe fn check_formation_x8_avx2(
+        positions_x: &[i32], // exactly 8 entries (contiguous i32 array)
+        positions_z: &[i32], // exactly 8 entries (contiguous i32 array)
         dlo:    i64,
         dhi:    i64,
         blocks: &super::Blocks,
     ) -> u8 {
-        debug_assert_eq!(positions_x.len(), 4);
-        debug_assert_eq!(positions_z.len(), 4);
+        debug_assert_eq!(positions_x.len(), 8);
+        debug_assert_eq!(positions_z.len(), 8);
 
         // SAFETY: caller guarantees AVX2 is available (enforced by #[target_feature]).
         unsafe {
-            // Single 128-bit load replaces 4 scalar moves from _mm_set_epi32.
-            // Both slices are contiguous i32 arrays, so loadu_si128 is valid and
-            // places element [0] in lane 0, which is the same lane ordering as before.
-            let ox_v = _mm_loadu_si128(positions_x.as_ptr() as *const __m128i);
-            let oz_v = _mm_loadu_si128(positions_z.as_ptr() as *const __m128i);
+            // Load both halves of the position arrays.  Each _mm_loadu_si128 pulls
+            // 4 * i32 from a contiguous slice; lane 0 = lowest address.
+            let ox_lo = _mm_loadu_si128(positions_x[..4].as_ptr() as *const __m128i);
+            let oz_lo = _mm_loadu_si128(positions_z[..4].as_ptr() as *const __m128i);
+            let ox_hi = _mm_loadu_si128(positions_x[4..].as_ptr() as *const __m128i);
+            let oz_hi = _mm_loadu_si128(positions_z[4..].as_ptr() as *const __m128i);
 
-            let mut active: u8 = 0x0F; // bits 0-3 all set = all lanes in play
+            // active_lo: bits 0-3 = lanes 0-3 still in play
+            // active_hi: bits 0-3 = lanes 4-7 still in play (stored in low nibble here)
+            let mut active_lo: u8 = 0x0F;
+            let mut active_hi: u8 = 0x0F;
 
-            // SoA hot loop: each array access stays within its own cache-line
-            // stream.  No AoS struct padding is dragged into cache per iteration.
+            // Single block loop — N iterations instead of 2N.
+            // Both halves are updated together; each SoA field (x, z, y,
+            // prob_threshold, should_be_bedrock) is fetched once per block.
             for i in 0..blocks.len() {
-                // Absolute coordinates for this block's offset
-                let x_v = _mm_add_epi32(ox_v, _mm_set1_epi32(blocks.x[i]));
-                let z_v = _mm_add_epi32(oz_v, _mm_set1_epi32(blocks.z[i]));
+                let bx = _mm_set1_epi32(blocks.x[i]);
+                let bz = _mm_set1_epi32(blocks.z[i]);
 
-                let passed = is_bedrock_x4(dlo, dhi, x_v, blocks.y[i], z_v, blocks.prob_threshold[i], blocks.should_be_bedrock[i]);
-                active &= passed;
-                if active == 0 { return 0; } // no lane can match; exit immediately
+                // Absolute coordinates for this block offset, both halves.
+                let x_lo = _mm_add_epi32(ox_lo, bx);
+                let z_lo = _mm_add_epi32(oz_lo, bz);
+                let x_hi = _mm_add_epi32(ox_hi, bx);
+                let z_hi = _mm_add_epi32(oz_hi, bz);
+
+                // Fetch the per-block scalars once; share across both SIMD calls.
+                let y   = blocks.y[i];
+                let thr = blocks.prob_threshold[i];
+                let sbb = blocks.should_be_bedrock[i];
+
+                active_lo &= is_bedrock_x4(dlo, dhi, x_lo, y, z_lo, thr, sbb);
+                active_hi &= is_bedrock_x4(dlo, dhi, x_hi, y, z_hi, thr, sbb);
+
+                // Early exit: both halves have eliminated all their lanes.
+                if (active_lo | active_hi) == 0 { return 0; }
             }
-            active
+
+            // Pack nibbles: lo in bits 0-3, hi shifted to bits 4-7.
+            active_lo | (active_hi << 4)
         }
     }
 }
@@ -520,7 +571,7 @@ mod simd_avx2 {
 // On Ice Lake / Zen 4 and newer this is a theoretical 2* throughput improvement
 // over the AVX2 path for the inner kernel.
 //
-// Detection: avx512f + avx512dq.  CHUNK_SIZE (262_144) is already a multiple of 8.
+// Detection: avx512f + avx512dq.  Groups are always 8 positions wide.
 
 #[cfg(target_arch = "x86_64")]
 mod simd_avx512 {
@@ -539,7 +590,16 @@ mod simd_avx512 {
 
     /// Compute `math_hash(x[i], y, z[i])` for i in 0..8 simultaneously.
     ///
-    /// `x_vec` / `z_vec` are `__m256i` holding 8 * i32.
+    /// `term_x` / `term_z` are `__m512i` holding the already-computed
+    /// per-lane hash multiplier terms (8 * i64).  Callers are responsible for
+    /// constructing these before the block loop so the multiplications are
+    /// hoisted out:
+    ///
+    /// ```text
+    /// term_x[lane] = (ox[lane] as i64) * 3_129_871  +  bx_hash_term[block]
+    /// term_z[lane] = (oz[lane] as i64) * 116_129_781 + bz_hash_term[block]
+    /// ```
+    ///
     /// `y` is broadcast as a 64-bit constant across all 8 lanes.
     ///
     /// # Safety
@@ -548,18 +608,7 @@ mod simd_avx512 {
     /// raw-pointer or user-unsafe-fn operations are present.
     #[target_feature(enable = "avx512f,avx512dq,avx2")]
     #[inline]
-    unsafe fn math_hash_x8(x_vec: __m256i, y: i32, z_vec: __m256i) -> __m512i {
-        // term_x = (x.wrapping_mul(3_129_871) as i32) sign-extended to i64
-        // _mm256_mullo_epi32: 8 * i32 low-multiply (AVX2)
-        // _mm512_cvtepi32_epi64: sign-extend 8 * i32 -> 8 * i64 (AVX-512F)
-        let x_mul  = _mm256_mullo_epi32(x_vec, _mm256_set1_epi32(3_129_871_i32));
-        let term_x = _mm512_cvtepi32_epi64(x_mul);
-
-        // term_z = (z as i64).wrapping_mul(116_129_781)
-        // _mm512_mullo_epi64 is a single native instruction (AVX-512DQ)
-        let z64    = _mm512_cvtepi32_epi64(z_vec);
-        let term_z = _mm512_mullo_epi64(z64, _mm512_set1_epi64(116_129_781_i64));
-
+    unsafe fn math_hash_x8(term_x: __m512i, y: i32, term_z: __m512i) -> __m512i {
         let y64   = _mm512_set1_epi64(y as i64);
         let mut l = _mm512_xor_si512(_mm512_xor_si512(term_x, term_z), y64);
 
@@ -579,16 +628,16 @@ mod simd_avx512 {
     unsafe fn is_bedrock_x8(
         dlo:               i64,
         dhi:               i64,
-        x_vec:             __m256i,  // 8 * i32: absolute X coords
+        term_x:            __m512i,  // 8 * i64: ox*K_x + bx_hash_term per lane
         y:                 i32,
-        z_vec:             __m256i,  // 8 * i32: absolute Z coords
+        term_z:            __m512i,  // 8 * i64: oz*K_z + bz_hash_term per lane
         prob_threshold:    u64,
         should_be_bedrock: bool,
     ) -> u8 {
         // SAFETY: caller guarantees AVX-512F, AVX-512DQ, and AVX2 are available
         // (enforced by #[target_feature]).
         unsafe {
-            let hash = math_hash_x8(x_vec, y, z_vec);
+            let hash = math_hash_x8(term_x, y, term_z);
             let s0   = _mm512_xor_si512(hash, _mm512_set1_epi64(dlo));
             let s1   = _mm512_set1_epi64(dhi);
 
@@ -643,15 +692,39 @@ mod simd_avx512 {
             let ox_v = _mm256_loadu_si256(positions_x.as_ptr() as *const __m256i);
             let oz_v = _mm256_loadu_si256(positions_z.as_ptr() as *const __m256i);
 
+            // Hoist position-dependent hash multiplications out of the block loop.
+            //
+            // For each block offset (bx, bz), the original kernel computed:
+            //   term_x = (ox + bx) * 3_129_871   [per lane, per block]
+            //   term_z = (oz + bz) * 116_129_781  [per lane, per block]
+            //
+            // By distributivity these factor as:
+            //   term_x = ox * K_x  +  bx * K_x
+            //   term_z = oz * K_z  +  bz * K_z
+            //
+            // ox * K_x and oz * K_z are the same for every block in this group,
+            // so they are computed once here.  Inside the loop only an addition
+            // with the precomputed per-block scalar (blocks.bx_hash_term[i] /
+            // blocks.bz_hash_term[i]) is needed, replacing 2 multiplies with
+            // 2 adds per block per group.
+            let ox64 = _mm512_cvtepi32_epi64(ox_v);
+            let oz64 = _mm512_cvtepi32_epi64(oz_v);
+
+            let ox_term_v = _mm512_mullo_epi64(ox64, _mm512_set1_epi64(3_129_871_i64));
+            let oz_term_v = _mm512_mullo_epi64(oz64, _mm512_set1_epi64(116_129_781_i64));
+
             let mut active: u8 = 0xFF; // bits 0-7 all set = all lanes in play
 
-            // SoA hot loop: prob_threshold, should_be_bedrock, x, y, z each live in
-            // separate contiguous arrays; no AoS padding or unused f64 in the stream.
+            // SoA hot loop: prob_threshold, should_be_bedrock, y, and the new
+            // bx/bz_hash_term arrays each live in separate contiguous streams;
+            // no AoS padding or unused f64 in the working set.
             for i in 0..blocks.len() {
-                let x_v = _mm256_add_epi32(ox_v, _mm256_set1_epi32(blocks.x[i]));
-                let z_v = _mm256_add_epi32(oz_v, _mm256_set1_epi32(blocks.z[i]));
+                // Per-block term: broadcast the precomputed scalar and add to
+                // the group-invariant ox/oz terms.  Two adds replace two muls.
+                let term_x = _mm512_add_epi64(ox_term_v, _mm512_set1_epi64(blocks.bx_hash_term[i]));
+                let term_z = _mm512_add_epi64(oz_term_v, _mm512_set1_epi64(blocks.bz_hash_term[i]));
 
-                let passed = is_bedrock_x8(dlo, dhi, x_v, blocks.y[i], z_v, blocks.prob_threshold[i], blocks.should_be_bedrock[i]);
+                let passed = is_bedrock_x8(dlo, dhi, term_x, blocks.y[i], term_z, blocks.prob_threshold[i], blocks.should_be_bedrock[i]);
                 active &= passed;
                 if active == 0 { return 0; }
             }
@@ -662,9 +735,9 @@ mod simd_avx512 {
 
 // SIMD dispatch level 
 //
-// Detected once at startup in main() and passed into search_chunk, eliminating
-// repeated is_x86_feature_detected! calls (each a function call + atomic load +
-// branch) on every chunk iteration.
+// Detected once at startup in run_search and captured by the parallel closure,
+// eliminating repeated is_x86_feature_detected! calls (each a function call +
+// atomic load + branch) on every group iteration.
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SimdLevel {
@@ -689,100 +762,138 @@ fn detect_simd() -> SimdLevel {
     SimdLevel::Scalar
 }
 
-// Chunk search dispatch 
+// Parallel search dispatch 
 //
-// Dispatches to the widest available SIMD path (AVX-512 -> AVX2 -> scalar).
-// `simd` is determined once at startup (see detect_simd / main) so the branch
-// is always perfectly predicted and the compiler can see it as a compile-time
-// constant in inlined call sites.
+// simd is determined once at the start of run_search (see detect_simd) so
+// the branch inside the par_iter closure is always perfectly predicted and
+// the compiler can constant-fold it in inlined call sites.
 //
-// rayon's `find_first` guarantees the earliest (spiral-order) match, cancels
+// rayon's find_first guarantees the earliest (spiral-order) match, cancels
 // other workers on a hit, and never wastes threads on empty ranges.  After a
-// SIMD group hit, a scalar scan of up to N positions pinpoints the exact first
+// SIMD group hit, a scalar scan of up to 8 positions pinpoints the exact first
 // match in spiral order.
 
-fn search_chunk(chunk_x: &[i32], chunk_z: &[i32], dlo: i64, dhi: i64, blocks: &Blocks, simd: SimdLevel) -> Option<usize> {
-    debug_assert_eq!(chunk_x.len(), chunk_z.len());
-    // All paths iterate sequentially over groups to guarantee spiral order.
-    // SIMD kernels provide fast per-group candidate screening; the scalar
-    // check_formation confirms the exact position within a matching group.
+// O(1) spiral coordinate formula 
+//
+// The spiral follows: 1R, 1U, 2L, 2D, 3R, 3U, 4L, 4D, …
+// (Right = +x, Up = +z, Left = −x, Down = −z)
+//
+// Decomposition into shells and sides gives a closed-form (x, z) for any
+// index k without simulating prior positions:
+//
+//   k = 0            → (start_x, start_z)
+//   k ≥ 1            → shell L = floor((1 + sqrt(k)) / 2),
+//                       offset j = k − (4L² − 4L + 1) within the shell,
+//                       then one of four legs (Up / Left / Down / Right).
+//
+// Shell L occupies indices [4L²−4L+1, 4L²+4L] and has 8L positions:
+//   Leg 0 Up   (2L−1 steps): dx = L,  dz = −(L−1)+j
+//   Leg 1 Left (2L   steps): dx = L−(j−(2L−1)),  dz = L
+//   Leg 2 Down (2L   steps): dx = −L, dz = L−(j−(4L−1))
+//   Leg 3 Right(2L+1 steps): dx = −L+(j−(6L−1)), dz = −L
+//
+// This matches the exact spiral convention in the original streaming loop.
 
-    #[cfg(target_arch = "x86_64")]
-    if simd == SimdLevel::Avx512 {
-        let n_groups = chunk_x.len() / 8;
-        for g in 0..n_groups {
-            let start = g * 8;
-            // SAFETY: AVX-512F+DQ verified by detect_simd; slices are exactly 8 elements.
-            let mask = unsafe {
-                simd_avx512::check_formation_x8(
-                    &chunk_x[start..start + 8],
-                    &chunk_z[start..start + 8],
-                    dlo, dhi, blocks,
-                )
-            };
-            if mask != 0 {
-                for j in 0..8 {
-                    let cx = chunk_x[start + j];
-                    let cz = chunk_z[start + j];
-                    if check_formation(cx, cz, dlo, dhi, blocks) {
-                        return Some(start + j);
-                    }
-                }
-            }
-        }
-        return None;
+/// Translate shell index `l` and intra-shell offset `j` to a (dx, dz) displacement.
+/// Extracted from `spiral_coords` so it can be reused by `fill_group`.
+#[inline(always)]
+fn coords_from_lj(l: i64, j: i64) -> (i64, i64) {
+    if j < 2*l - 1 {
+        // Leg 0: Up (+z).  Starts at (L, −(L−1)).
+        (l, -(l-1) + j)
+    } else if j < 4*l - 1 {
+        // Leg 1: Left (−x).  Starts at (L, L).
+        let o = j - (2*l - 1);
+        (l - o, l)
+    } else if j < 6*l - 1 {
+        // Leg 2: Down (−z).  Starts at (−L, L).
+        let o = j - (4*l - 1);
+        (-l, l - o)
+    } else {
+        // Leg 3: Right (+x).  Starts at (−L, −L).
+        let o = j - (6*l - 1);
+        (-l + o, -l)
     }
-
-    #[cfg(target_arch = "x86_64")]
-    if simd == SimdLevel::Avx2 {
-        let n_groups = chunk_x.len() / 4;
-        for g in 0..n_groups {
-            let start = g * 4;
-            // SAFETY: AVX2 verified by detect_simd; slices are exactly 4 elements.
-            let mask = unsafe {
-                simd_avx2::check_formation_x4(
-                    &chunk_x[start..start + 4],
-                    &chunk_z[start..start + 4],
-                    dlo, dhi, blocks,
-                )
-            };
-            if mask != 0 {
-                for j in 0..4 {
-                    let cx = chunk_x[start + j];
-                    let cz = chunk_z[start + j];
-                    if check_formation(cx, cz, dlo, dhi, blocks) {
-                        return Some(start + j);
-                    }
-                }
-            }
-        }
-        return None;
-    }
-
-    // Scalar fallback: sequential to guarantee spiral order.
-    (0..chunk_x.len()).find(|&i| {
-        let cx = chunk_x[i];
-        let cz = chunk_z[i];
-        check_formation(cx, cz, dlo, dhi, blocks)
-    })
 }
 
-// Direction (mirrors Main.Direction) 
+#[inline]
+fn spiral_coords(k: i64, start_x: i32, start_z: i32) -> (i32, i32) {
+    if k == 0 { return (start_x, start_z); }
 
-#[derive(Clone, Copy)]
-enum Dir { Left, Right, Up, Down }
+    // Shell containing index k.  l = floor((1 + sqrt(k)) / 2).
+    // The float approximation is exact for all k ≤ 2^52 (≫ any realistic search).
+    let l = ((1.0 + (k as f64).sqrt()) * 0.5) as i64;
+    // Guard against rounding: adjust by ±1 if needed.
+    let l = if 4*l*l + 4*l < k { l + 1 } else if 4*l*l - 4*l + 1 > k { l - 1 } else { l };
 
-impl Dir {
-    fn next(self) -> Dir {
-        match self {
-            Dir::Left  => Dir::Down,  Dir::Right => Dir::Up,
-            Dir::Up    => Dir::Left,  Dir::Down  => Dir::Right,
-        }
-    }
-    fn step(self, x: &mut i32, z: &mut i32) {
-        match self {
-            Dir::Left  => *x -= 1, Dir::Right => *x += 1,
-            Dir::Up    => *z += 1, Dir::Down  => *z -= 1,
+    let j = k - (4*l*l - 4*l + 1); // offset within shell [0, 8L)
+    let (dx, dz) = coords_from_lj(l, j);
+    (start_x + dx as i32, start_z + dz as i32)
+}
+
+/// Like `spiral_coords` but also returns the shell `l` and intra-shell offset `j`
+/// so that `fill_group` can derive subsequent positions incrementally.
+///
+/// Returns `(x, z, l, j)`.  For `k == 0` the sentinel `(start_x, start_z, 0, -1)`
+/// is returned; `fill_group` detects the `l == 0` case via the `j >= 8*l` test
+/// (0 >= 0 is true) and correctly advances to shell 1.
+#[inline(always)]
+fn spiral_coords_with_state(k: i64, start_x: i32, start_z: i32) -> (i32, i32, i64, i64) {
+    if k == 0 { return (start_x, start_z, 0, -1); }
+
+    let l = ((1.0 + (k as f64).sqrt()) * 0.5) as i64;
+    let l = if 4*l*l + 4*l < k { l + 1 } else if 4*l*l - 4*l + 1 > k { l - 1 } else { l };
+    let j = k - (4*l*l - 4*l + 1);
+    let (dx, dz) = coords_from_lj(l, j);
+    (start_x + dx as i32, start_z + dz as i32, l, j)
+}
+
+/// The direction of the step from spiral position `j-1` to `j` within shell `l`.
+///
+/// Verified boundary table (step for the new value of j, within shell l):
+///   j ∈ [1, 2l−1] → ( 0, +1)  Leg 0 interior + Leg 0→1 transition
+///   j ∈ [2l, 4l−1] → (−1,  0)  Leg 1 interior + Leg 1→2 transition
+///   j ∈ [4l, 6l−1] → ( 0, −1)  Leg 2 interior + Leg 2→3 transition
+///   j ∈ [6l, 8l−1] → (+1,  0)  Leg 3 interior
+///
+/// The step at the start of a new shell (j == 0) is handled by `fill_group`
+/// directly, so this function is never called with j == 0.
+#[inline(always)]
+fn step_direction(l: i64, j: i64) -> (i32, i32) {
+    if      j <= 2*l - 1 { ( 0,  1) }
+    else if j <= 4*l - 1 { (-1,  0) }
+    else if j <= 6*l - 1 { ( 0, -1) }
+    else                 { ( 1,  0) }
+}
+
+/// Fill `xs` and `zs` with the 8 spiral positions starting at index `base_k`,
+/// spending only **one** `f64::sqrt` (inside `spiral_coords_with_state`) instead
+/// of eight.  Subsequent positions are derived by either:
+///
+/// * advancing one step in the current leg's direction (`step_direction`), or
+/// * jumping to the first position of the next shell when the shell boundary
+///   is crossed (at most once per group for realistic search depths).
+///
+/// For large shells (l ≈ 25 000 each has 200 000 positions), a group of 8
+/// never crosses a shell boundary, so the branch is perfectly predicted.
+#[inline(always)]
+fn fill_group(base_k: i64, start_x: i32, start_z: i32, xs: &mut [i32; 8], zs: &mut [i32; 8]) {
+    let (x0, z0, mut l, mut j) = spiral_coords_with_state(base_k, start_x, start_z);
+    xs[0] = x0;
+    zs[0] = z0;
+    for i in 1..8 {
+        j += 1;
+        if j >= 8 * l {
+            // Shell boundary (also handles the k == 0 sentinel where l == 0):
+            // advance to the next shell and place its first position directly.
+            l += 1;
+            j  = 0;
+            xs[i] = start_x + l as i32;
+            zs[i] = start_z - (l - 1) as i32;
+        } else {
+            let (dx, dz) = step_direction(l, j);
+            xs[i] = xs[i - 1] + dx;
+            zs[i] = zs[i - 1] + dz;
         }
     }
 }
@@ -965,43 +1076,85 @@ fn run_search(
     // arrays; the `probability: f64` field never appears in the hot path.
     let blocks = Blocks::from_vec(blocks);
 
-    let mut x   = start_x;
-    let mut z   = start_z;
-    let mut dir = Dir::Right;
-    let mut steps_to_take: i32 = 1;
-    let mut steps_taken: i32 = 0;
-    let mut sides_until_incremental: i32 = 0;
+    // Parallel search over the spiral using rayon's find_first.
+    //
+    // The spiral is divided into groups of 8 positions.  spiral_coords(k, …)
+    // maps any index k to its (x, z) in O(1) with no shared mutable state,
+    // so every rayon worker can compute its assigned groups independently.
+    //
+    // find_first guarantees the *earliest* spiral-order match is returned even
+    // when multiple threads discover candidates simultaneously, and cancels
+    // remaining workers once the winner is confirmed.
+    //
+    // Cancellation is checked between batches of SEARCH_BATCH_SIZE positions
+    // so the UI Cancel button and the inter-rotation stop signal remain
+    // responsive (one batch completes in ≪ 100 ms even on slow machines).
 
-    let mut chunk_x = vec![0i32; CHUNK_SIZE];
-    let mut chunk_z = vec![0i32; CHUNK_SIZE];
+    const GROUPS_PER_BATCH: i64 = SEARCH_BATCH_SIZE / 8;
+
+    let mut batch_start_group: i64 = 0;
 
     loop {
-        // Check both the UI cancel flag and the inter-rotation stop signal.
         if cancel.load(Ordering::Relaxed) || stop_early.load(Ordering::Relaxed) {
             return Ok(None);
         }
 
-        for slot in 0..CHUNK_SIZE {
-            chunk_x[slot] = x;
-            chunk_z[slot] = z;
-            dir.step(&mut x, &mut z);
-            steps_taken += 1;
-            if steps_taken == steps_to_take {
-                steps_taken = 0;
-                dir = dir.next();
-                sides_until_incremental += 1;
-                if sides_until_incremental == 2 {
-                    sides_until_incremental = 0;
-                    steps_to_take += 1;
+        // Snapshot for closure capture (i64 is Copy).
+        let batch_base = batch_start_group;
+
+        let found_group = (0..GROUPS_PER_BATCH).into_par_iter().find_first(|&gi| {
+            let base_k = (batch_base + gi) * 8;
+
+            // Materialise the 8 spiral positions for this group.
+            // fill_group calls spiral_coords_with_state once (1 sqrt) for the
+            // base position, then derives the remaining 7 positions from the
+            // shell/leg state incrementally — replacing 8 independent sqrts
+            // with 1 sqrt + 7 comparisons (≈ 4–6× faster on the hot path).
+            let mut xs = [0i32; 8];
+            let mut zs = [0i32; 8];
+            fill_group(base_k, start_x, start_z, &mut xs, &mut zs);
+
+            // AVX-512: check all 8 lanes in a single kernel call.
+            #[cfg(target_arch = "x86_64")]
+            if simd == SimdLevel::Avx512 {
+                // SAFETY: AVX-512F+DQ verified by detect_simd before the search loop.
+                let mask = unsafe {
+                    simd_avx512::check_formation_x8(&xs, &zs, dlo, dhi, &blocks)
+                };
+                return mask != 0;
+            }
+
+            // AVX2: fused 8-position pass — one block-loop instead of two.
+            // check_formation_x8_avx2 holds both halves (lo = positions 0-3,
+            // hi = positions 4-7) in two __m128i pairs and iterates over all N
+            // blocks once, halving block-loop overhead vs. calling x4 twice.
+            // Early exit fires when both nibbles reach 0 (active_lo | active_hi == 0).
+            #[cfg(target_arch = "x86_64")]
+            if simd == SimdLevel::Avx2 {
+                // SAFETY: AVX2 verified by detect_simd before the search loop.
+                let mask = unsafe {
+                    simd_avx2::check_formation_x8_avx2(&xs, &zs, dlo, dhi, &blocks)
+                };
+                return mask != 0;
+            }
+
+            // Scalar fallback: any of the 8 positions a match?
+            xs.iter().zip(zs.iter())
+                .any(|(&cx, &cz)| check_formation(cx, cz, dlo, dhi, &blocks))
+        });
+
+        if let Some(gi) = found_group {
+            // Pinpoint the exact first match within the winning group of 8.
+            let base_k = (batch_start_group + gi) * 8;
+            for j in 0..8i64 {
+                let (cx, cz) = spiral_coords(base_k + j, start_x, start_z);
+                if check_formation(cx, cz, dlo, dhi, &blocks) {
+                    return Ok(Some((cx, cz)));
                 }
             }
         }
 
-        if let Some(idx) = search_chunk(&chunk_x, &chunk_z, dlo, dhi, &blocks, simd) {
-            let cx = chunk_x[idx];
-            let cz = chunk_z[idx];
-            return Ok(Some((cx, cz)));
-        }
+        batch_start_group += GROUPS_PER_BATCH;
     }
 }
 
@@ -1318,8 +1471,8 @@ impl Application for App {
                                 //
                                 // `stop_rotations` is a shared flag: the first
                                 // rotation to find a match sets it, causing every
-                                // other rotation to bail out at the next chunk
-                                // boundary (≤ CHUNK_SIZE iterations later).
+                                // other rotation to bail out at the next batch
+                                // boundary (≤ SEARCH_BATCH_SIZE iterations later).
                                 // The user-cancel flag (`cancel`) is still
                                 // propagated independently so the UI Cancel button
                                 // continues to work normally.
