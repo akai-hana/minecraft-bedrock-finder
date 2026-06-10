@@ -30,7 +30,7 @@ const FALLBACK_HI: u64 = 7_640_891_576_956_012_809_u64;
 //
 // At ~100 M positions/s per core with 8 cores that is ~800 M positions/s, so
 // 2^20 (≈ 1 M) positions per batch ≈ 1 ms per batch — short enough that the
-// cancel button feels instant.  Must be a multiple of 8 (AVX-512 group size).
+// cancel button feels instant.  Must be a multiple of 8 (SIMD group size).
 const SEARCH_BATCH_SIZE: i64 = 1 << 20; // 1_048_576; must be a multiple of 8
 const _: () = assert!(SEARCH_BATCH_SIZE % 8 == 0, "SEARCH_BATCH_SIZE must be a multiple of 8");
 
@@ -42,18 +42,20 @@ const _: () = assert!(SEARCH_BATCH_SIZE % 8 == 0, "SEARCH_BATCH_SIZE must be a m
 // sqrt); every subsequent group in the chunk is derived with comparisons and
 // integer adds alone.
 //
-// For GROUPS_PER_CHUNK = 512 this reduces sqrt calls from 1 per 8 positions
-// to 1 per 4 096 positions — a 512× reduction.  On a typical 3 GHz machine
-// vsqrtsd costs ~20 cycles, so the saving is ~(511/512) × 20 cycles per 8
+// For GROUPS_PER_CHUNK = 1 024 this reduces sqrt calls from 1 per 8 positions
+// to 1 per 8 192 positions — a 1 024× reduction.  On a typical 3 GHz machine
+// vsqrtsd costs ~20 cycles, so the saving is ~(1023/1024) × 20 cycles per 8
 // positions ≈ 20 cycles/group, which is significant relative to the ~30–50
 // cycle hot-path cost of check_formation_x8 after an early-exit on block 0.
 //
 // Raised from 128 to 512 (optimisation 8): amortises the one sqrt per chunk
-// over 4 096 positions instead of 1 024.  CHUNKS_PER_BATCH = 131072/512 = 256,
-// which still provides ample parallelism for any realistic core count.
+// over 4 096 positions instead of 1 024.  Raised again from 512 to 1 024
+// (optimisation 10): amortises over 8 192 positions.  CHUNKS_PER_BATCH =
+// 131072/1024 = 128, which is still ample parallelism for machines with ≤ 32
+// cores (Rayon's work-stealing handles the reduced granularity well).
 //
 // Constraints: must evenly divide GROUPS_PER_BATCH (= SEARCH_BATCH_SIZE / 8).
-const GROUPS_PER_CHUNK: i64 = 512;
+const GROUPS_PER_CHUNK: i64 = 1024;
 const GROUPS_PER_BATCH: i64 = SEARCH_BATCH_SIZE / 8;
 const CHUNKS_PER_BATCH: i64 = GROUPS_PER_BATCH / GROUPS_PER_CHUNK;
 const _: () = assert!(
@@ -73,7 +75,13 @@ impl BedrockType {
             BedrockType::Roof  => "minecraft:bedrock_roof",
         }
     }
+    /// The Y coordinate at which this bedrock layer is always solid (probability ≥ 1).
+    /// For Floor this is the bottom (−64); for Roof this is the top (128).
+    /// NOTE: for Roof, min() > max(); see compute_probability for how this is used.
     fn min(self) -> i32 { match self { BedrockType::Floor => -64, BedrockType::Roof => 128 } }
+    /// The Y coordinate at which this bedrock layer is always air (probability ≤ 0).
+    /// For Floor this is −59; for Roof this is 123.
+    /// NOTE: for Roof, max() < min(); the names reflect always-solid vs always-air, not ordering.
     fn max(self) -> i32 { match self { BedrockType::Floor => -59, BedrockType::Roof => 123 } }
 }
 
@@ -209,10 +217,14 @@ struct AlignedVec<T> {
 unsafe impl<T: Send> Send for AlignedVec<T> {}
 unsafe impl<T: Sync> Sync for AlignedVec<T> {}
 
-impl<T> AlignedVec<T> {
-    /// Collect an iterator into a 64-byte-aligned heap allocation.
-    fn from_iter(iter: impl Iterator<Item = T> + ExactSizeIterator) -> Self {
-        let len = iter.len();
+impl<T: Copy> AlignedVec<T> {
+    /// Copy a slice into a 64-byte-aligned heap allocation.
+    ///
+    /// Uses a single `ptr::copy_nonoverlapping` (→ memcpy / vmovdqu chain),
+    /// eliminating five intermediate `Vec<T>` alloc → fill → dealloc
+    /// round-trips in `Blocks::from_vec`.
+    fn from_slice(s: &[T]) -> Self {
+        let len = s.len();
         if len == 0 {
             return Self {
                 ptr:    std::ptr::NonNull::dangling(),
@@ -227,18 +239,15 @@ impl<T> AlignedVec<T> {
         // SAFETY: layout is non-zero-size (len > 0 and size_of::<T>() >= 1).
         let raw = unsafe { alloc(layout) } as *mut T;
         if raw.is_null() { handle_alloc_error(layout); }
-        for (i, val) in iter.enumerate() {
-            // SAFETY: raw is valid for `len` writes; no overlap.
-            unsafe { raw.add(i).write(val); }
-        }
+        // SAFETY: raw is valid for `len` writes; s.as_ptr() is valid for `len`
+        // reads; they are distinct heap allocations with no overlap.
+        unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), raw, len); }
         Self {
             ptr:    std::ptr::NonNull::new(raw).unwrap(),
             len,
             layout,
         }
     }
-
-    #[inline(always)] fn len(&self) -> usize { self.len }
 }
 
 impl<T> std::ops::Deref for AlignedVec<T> {
@@ -254,7 +263,7 @@ impl<T> std::ops::Deref for AlignedVec<T> {
 impl<T> Drop for AlignedVec<T> {
     fn drop(&mut self) {
         if self.len == 0 { return; }
-        // SAFETY: we own the allocation; elements were initialised in from_iter.
+        // SAFETY: we own the allocation; elements were initialised in from_slice.
         unsafe {
             for i in 0..self.len {
                 self.ptr.as_ptr().add(i).drop_in_place();
@@ -272,18 +281,29 @@ impl<T> Drop for AlignedVec<T> {
 // cache-line fetch.
 //
 // With SoA, each field lives in its own contiguous array.  The hot SIMD loop
-// only touches `x`, `z`, `y`, `prob_threshold`, and `should_be_bedrock`:
-// five independent streams that each stay cache-line-local.  The scalar
-// confirmation path also uses `prob_threshold` (integer comparison), so the
-// raw `probability: f64` field is not retained in this struct at all.
+// touches `bx_hash_term`, `bz_hash_term`, `y`, `prob_threshold`, and `sbb_xor`:
+// five independent streams that each stay cache-line-local.  The raw `x` and
+// `z` coordinates are not stored — they are folded into `bx_hash_term` and
+// `bz_hash_term` once at construction time.  The raw `probability: f64` field
+// is also not retained; it is converted to the integer `prob_threshold` instead.
 //
 // Conversion from the AoS `Vec<Block>` (used for building, sorting, and
 // rotating) happens once in `run_search`, just before the search loop begins.
 struct Blocks {
-    x:                 AlignedVec<i32>,
-    y:                 AlignedVec<i32>,
-    z:                 AlignedVec<i32>,
-    should_be_bedrock: AlignedVec<bool>,
+    y:            AlignedVec<i32>,
+    /// Per-block XOR mask used to negate the bedrock-mask in non-bedrock
+    /// blocks without a branch.
+    ///
+    /// Encoding: `0x00` when `should_be_bedrock` is true (pass = bedrock),
+    /// `0xFF` when false (pass = non-bedrock, i.e. `bedrock_mask ^ 0xFF`).
+    ///
+    /// In the SIMD kernels: `active &= bedrock_mask ^ sbb_xor[i]`.
+    /// The existing `active` initialisation (0xFF / 0x0F) naturally masks off
+    /// the upper bits produced by the XOR in the 4-lane AVX2 path, so no
+    /// extra `& 0x0F` is needed.
+    ///
+    /// In the scalar path: `let sbb = sbb_xor[i] == 0; if sbb != is_bed { … }`.
+    sbb_xor:      AlignedVec<u8>,
     /// Integer threshold `(probability * 2^24) as u64`.  Used by both the
     /// SIMD hot loop and the scalar confirmation path; the raw `f64`
     /// probability is not stored here.
@@ -309,24 +329,43 @@ struct Blocks {
 
 impl Blocks {
     fn from_vec(v: Vec<Block>) -> Self {
-        Self {
-            x:                 AlignedVec::from_iter(v.iter().map(|b| b.x)),
-            y:                 AlignedVec::from_iter(v.iter().map(|b| b.y)),
-            z:                 AlignedVec::from_iter(v.iter().map(|b| b.z)),
-            should_be_bedrock: AlignedVec::from_iter(v.iter().map(|b| b.should_be_bedrock)),
-            prob_threshold:    AlignedVec::from_iter(v.iter().map(|b| b.prob_threshold)),
+        // Flaw 6 fix: collect all five fields in a single pass over `v` instead of
+        // iterating five times.  Each `Block` is ≥ 32 bytes; five separate passes
+        // read 5× the data unnecessarily and defeat the cache-line-local access
+        // pattern the SoA layout is designed to achieve.
+        //
+        // Optimisation 11: use AlignedVec::from_slice (→ copy_nonoverlapping),
+        // eliminating five intermediate Vec alloc → fill → dealloc round-trips.
+        let n = v.len();
+        let mut ys   = Vec::with_capacity(n);
+        let mut sbbs = Vec::with_capacity(n);
+        let mut thrs = Vec::with_capacity(n);
+        let mut bzs  = Vec::with_capacity(n);
+        let mut bxs  = Vec::with_capacity(n);
+        for b in &v {
+            ys.push(b.y);
+            // sbb_xor encoding: 0x00 = should be bedrock, 0xFF = should be non-bedrock.
+            // SIMD kernels XOR the bedrock mask with this value to negate it
+            // branchlessly; the scalar path recovers `sbb = sbb_xor == 0`.
+            sbbs.push(if b.should_be_bedrock { 0x00u8 } else { 0xFFu8 });
+            thrs.push(b.prob_threshold);
             // bz_hash_term: precomputed (bz as i64) * 116_129_781.
             // Used by the AVX-512 and AVX2 kernels to hoist oz*K_z out of the block loop.
-            bz_hash_term:      AlignedVec::from_iter(v.iter().map(|b| (b.z as i64).wrapping_mul(116_129_781_i64))),
+            bzs.push((b.z as i64).wrapping_mul(116_129_781_i64));
             // bx_hash_term: precomputed bx.wrapping_mul(3_129_871) in i32 space.
             // Wrapping i32 multiplication distributes over addition in Z/2³²Z, so
             // (ox + bx) * K ≡ ox*K + bx*K (mod 2³²).  The ox*K multiply is hoisted
             // once before the block loop; inside the loop only a cheap i32 add is needed.
-            bx_hash_term:      AlignedVec::from_iter(v.iter().map(|b| b.x.wrapping_mul(3_129_871_i32))),
+            bxs.push(b.x.wrapping_mul(3_129_871_i32));
+        }
+        Self {
+            y:            AlignedVec::from_slice(&ys),
+            sbb_xor:      AlignedVec::from_slice(&sbbs),
+            prob_threshold: AlignedVec::from_slice(&thrs),
+            bz_hash_term: AlignedVec::from_slice(&bzs),
+            bx_hash_term: AlignedVec::from_slice(&bxs),
         }
     }
-
-    #[inline(always)] fn len(&self) -> usize { self.x.len() }
 }
 
 // Formation check (mirrors Main.checkFormation) 
@@ -358,12 +397,32 @@ fn check_formation(ox: i32, oz: i32, dlo: i64, dhi: i64, blocks: &Blocks) -> boo
     // identical reasoning to the SIMD paths — guard_zero is removed here too
     // (optimisation 7).  Retain a debug_assert for parity with the SIMD kernels.
     debug_assert_ne!(dhi, 0, "deriver hi seed must be non-zero");
-    for i in 0..blocks.len() {
+
+    // Flaw 5 fix: bind all five AlignedVec fields to local slice references before
+    // the loop.  Each AlignedVec carries its own independent `len` field, so the
+    // compiler cannot prove at the indexing site that `i` is in bounds for all five
+    // arrays given only that `i < blocks.len()`.  LLVM therefore emits five separate
+    // cmp+branch pairs per iteration.  By extracting slices of a single known length
+    // and asserting length parity once, LLVM has enough aliasing information to hoist
+    // all bounds checks out of the loop body entirely.
+    let bx_s  = &blocks.bx_hash_term[..];
+    let bz_s  = &blocks.bz_hash_term[..];
+    let y_s   = &blocks.y[..];
+    let thr_s = &blocks.prob_threshold[..];
+    let sbb_s = &blocks.sbb_xor[..];
+    let n     = bx_s.len();
+    // One assertion gives LLVM the length-parity proof for all five arrays.
+    assert_eq!(n, bz_s.len(),  "Blocks field length mismatch: bz_hash_term");
+    assert_eq!(n, y_s.len(),   "Blocks field length mismatch: y");
+    assert_eq!(n, thr_s.len(), "Blocks field length mismatch: prob_threshold");
+    assert_eq!(n, sbb_s.len(), "Blocks field length mismatch: sbb_xor");
+
+    for i in 0..n {
         // x: (ox + bx)*K in i32 space, sign-extended to i64 (matches Java semantics)
-        let term_x = ox_i32_term.wrapping_add(blocks.bx_hash_term[i]) as i64;
+        let term_x = ox_i32_term.wrapping_add(bx_s[i]) as i64;
         // z: true i64 multiply, distributive in 64-bit space
-        let term_z = oz_i64_term.wrapping_add(blocks.bz_hash_term[i]);
-        let mut l = term_x ^ term_z ^ (blocks.y[i] as i64);
+        let term_z = oz_i64_term.wrapping_add(bz_s[i]);
+        let mut l = term_x ^ term_z ^ (y_s[i] as i64);
         // Factored two-multiply form (optimization 1): l*(l*K + 11) = l²*K + l*11
         let inner = l.wrapping_mul(42_317_861_i64).wrapping_add(11_i64);
         l = l.wrapping_mul(inner);
@@ -371,8 +430,10 @@ fn check_formation(ox: i32, oz: i32, dlo: i64, dhi: i64, blocks: &Blocks) -> boo
         let s0 = (hash ^ dlo) as u64;
         let s1 = dhi as u64;
         let result = s0.wrapping_add(s1).rotate_left(17).wrapping_add(s0);
-        let is_bed = (result >> 40) < blocks.prob_threshold[i];
-        if blocks.should_be_bedrock[i] != is_bed { return false; }
+        let is_bed = (result >> 40) < thr_s[i];
+        // sbb_xor encoding: 0x00 = should be bedrock, 0xFF = should be non-bedrock.
+        let sbb = sbb_s[i] == 0;
+        if sbb != is_bed { return false; }
     }
     true
 }
@@ -454,6 +515,28 @@ mod simd_avx2 {
         _mm256_add_epi64(lo_lo, cross)
     }
 
+    /// Low 64 bits of 4-lane 64-bit × 32-bit multiply (optimisation 12).
+    ///
+    /// Use when `b` fits in 32 bits — i.e. the high 32 bits of every 64-bit
+    /// lane in `b` are zero (for example a constant loaded with
+    /// `_mm256_set1_epi64x(K)` where `K < 2^32`).  Saves one `mul_epu32`
+    /// and one `add_epi64` vs the general `mullo_epi64`:
+    ///
+    ///   a*b (low 64) = a_lo*b_lo + a_hi*b_lo * 2^32
+    ///                  (a_lo*b_hi and a_hi*b_hi vanish because b_hi == 0)
+    ///
+    /// # Safety
+    /// Caller must guarantee AVX2 is available and that the high 32 bits of
+    /// every lane in `b` are zero; the result is undefined otherwise.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn mullo_epi64_small_b(a: __m256i, b: __m256i) -> __m256i {
+        let a_hi  = _mm256_srli_epi64(a, 32);
+        let lo_lo = _mm256_mul_epu32(a, b);                // a_lo * b_lo
+        let cross = _mm256_slli_epi64(_mm256_mul_epu32(a_hi, b), 32); // a_hi * b_lo << 32
+        _mm256_add_epi64(lo_lo, cross)
+    }
+
     /// Rotate each 64-bit lane left by 17 bits.
     ///
     /// # Safety
@@ -467,54 +550,28 @@ mod simd_avx2 {
 
     // Core SIMD kernel 
 
-    /// Compute `math_hash(x[i], y, z[i])` for i in 0..4 simultaneously.
+    /// Compute `math_hash` for 4 lanes with a pre-computed z-term.
     ///
-    /// `x_term_i32` is a `__m128i` holding 4 * i32: the already-computed per-lane
-    /// x hash term `(ox[lane] + bx).wrapping_mul(3_129_871)` in i32 wrapping
-    /// arithmetic.  The caller hoists `ox * K_x` before the block loop and adds
-    /// the precomputed `bx * K_x` (from `Blocks::bx_hash_term`) inside; this
-    /// function sign-extends the i32 result to i64, matching Java's
-    /// `(long)(x * 3129871)` semantics.
-    /// `z_vec` is `__m128i` holding 4 * i32 (lane 0 = lowest address).
-    /// `y` is the same for all lanes and is broadcast to a 64-bit constant.
+    /// `term_z` is a `__m256i` of 4 * i64 values already carrying
+    /// `(oz as i64) * K_z + bz_hash_term`, allowing the caller to hoist the
+    /// expensive `cvtepi32_epi64` + multiply out of the block loop and replace
+    /// it with a single cheap `add_epi64`.
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn math_hash_x4(x_term_i32: __m128i, y: i32, z_vec: __m128i) -> __m256i {
-        // SAFETY: caller guarantees AVX2 is available (enforced by #[target_feature]).
+    unsafe fn math_hash_x4_precomputed(x_term_i32: __m128i, y: i32, term_z: __m256i) -> __m256i {
         unsafe {
-            // term_x: sign-extend the pre-multiplied i32 result to i64, matching
-            // Java's `(long)(x * 3129871)` semantics.  The i32 wrapping multiply
-            // was already performed by the caller (hoisted ox*K + bx*K in i32 space).
             let term_x = _mm256_cvtepi32_epi64(x_term_i32);
+            let y64    = _mm256_set1_epi64x(y as i64);
+            let mut l  = _mm256_xor_si256(_mm256_xor_si256(term_x, term_z), y64);
 
-            // term_z = (z as i64).wrapping_mul(116_129_781)
-            // Both z and 116_129_781 fit in i32, so _mm256_mul_epi32, which uses
-            // only the low 32 bits of each 64-bit lane (signed * signed -> 64-bit),
-            // gives the exact same result as the scalar i64 multiply.
-            let z64    = _mm256_cvtepi32_epi64(z_vec);
-            let term_z = _mm256_mul_epi32(z64, _mm256_set1_epi64x(116_129_781_i64));
-
-            // l = term_x ^ term_z ^ (y as i64)
-            let y64   = _mm256_set1_epi64x(y as i64);
-            let mut l = _mm256_xor_si256(_mm256_xor_si256(term_x, term_z), y64);
-
-            // l² · K + l · 11  =  l · (l · K + 11)  — two mullo_epi64 instead of three.
-            // AVX2 emulates each mullo_epi64 with ~5 instructions, so dropping one
-            // emulated multiply removes roughly five instructions per group on this path.
-            // Wrapping 64-bit multiplication distributes over addition (mod 2⁶⁴),
-            // so the result is identical to the original three-multiply form.
             let inner = _mm256_add_epi64(
-                mullo_epi64(l, _mm256_set1_epi64x(42_317_861_i64)),
+                // 42_317_861 < 2^32, so the cheap small-b form saves one mul_epu32
+                // and one add_epi64 vs the general mullo_epi64.
+                mullo_epi64_small_b(l, _mm256_set1_epi64x(42_317_861_i64)),
                 _mm256_set1_epi64x(11_i64),
             );
             l = mullo_epi64(l, inner);
 
-            // l >> 16 (arithmetic / signed).  MUST match the scalar `l >> 16` on i64.
-            // When l is negative the top 16 bits are 0xFFFF, not 0x0000; using srli
-            // (logical) here produces a wrong hash for any negative l.
-            // AVX2 has no _mm256_srai_epi64, so we emulate it:
-            //   arithmetic_sra(x, 16) = srli(x, 16) | (sign_mask & 0xFFFF000000000000)
-            // where sign_mask is all-ones in lanes where x < 0, all-zeros otherwise.
             let logical   = _mm256_srli_epi64(l, 16);
             let sign_mask = _mm256_cmpgt_epi64(_mm256_setzero_si256(), l);
             let top16     = _mm256_and_si256(
@@ -528,55 +585,44 @@ mod simd_avx2 {
     /// Returns a 4-bit mask: bit `i` is set if position `i` passes the
     /// `is_bedrock` test for the given block parameters.
     ///
-    /// Assumes `probability in (0, 1)`: trivially-guaranteed blocks are
-    /// filtered out before the search starts and never reach this path.
+    /// Accepts a pre-computed `term_z` (`__m256i` of 4 * i64) carrying
+    /// `(oz as i64) * K_z + bz_hash_term`, avoiding the per-block
+    /// `cvtepi32_epi64` + multiply inside the hash kernel.
     ///
-    /// Uses the precomputed integer threshold to avoid float conversion.
+    /// `sbb_xor` is the precomputed XOR mask from `Blocks::sbb_xor`:
+    ///   0x00 → position is bedrock = pass
+    ///   0xFF → position is non-bedrock = pass (inverts the mask)
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn is_bedrock_x4(
-        dlo:               i64,
-        dhi:               i64,
-        x_term_i32:        __m128i,  // 4 * i32: (ox+bx)*K_x in i32 wrapping space (pre-multiplied)
-        y:                 i32,
-        z_vec:             __m128i,  // 4 * i32: absolute Z coords
-        prob_threshold:    u64,
-        should_be_bedrock: bool,
+    unsafe fn is_bedrock_x4_precomputed(
+        dlo:        i64,
+        dhi:        i64,
+        x_term_i32: __m128i,  // 4 * i32: (ox+bx)*K_x in i32 wrapping space
+        y:          i32,
+        term_z:     __m256i,  // 4 * i64: oz*K_z + bz_hash_term (pre-computed)
+        prob_threshold: u64,
+        sbb_xor:    u8,       // 0x00 = bedrock expected, 0xFF = non-bedrock expected
     ) -> u8 {
-        // SAFETY: caller guarantees AVX2 is available (enforced by #[target_feature]).
         unsafe {
-            // s0 = (math_hash(x, y, z) ^ dlo) as u64  (per lane)
-            // s1 = dhi as u64  (same for every lane, broadcast)
-            let hash = math_hash_x4(x_term_i32, y, z_vec);
+            let hash = math_hash_x4_precomputed(x_term_i32, y, term_z);
             let s0   = _mm256_xor_si256(hash, _mm256_set1_epi64x(dlo));
             let s1   = _mm256_set1_epi64x(dhi);
 
-            // guard_zero removed from SIMD hot path: dhi is derived from MD5 ^ xoroshiro
-            // output, making zero cryptographically impossible in practice.  The scalar
-            // is_bedrock retains the guard for correctness on theoretical edge cases.
-            // Removing the or/cmpeq/blendv trio saves 3 instructions per block per group.
             debug_assert_ne!(dhi, 0, "deriver hi seed must be non-zero");
 
-            // xoroshiro128++ single step: result = (s0 + s1).rotate_left(17) + s0
             let sum    = _mm256_add_epi64(s0, s1);
             let result = _mm256_add_epi64(rotl17_epi64(sum), s0);
 
-            // Integer threshold comparison replaces the float conversion chain.
-            //
-            // Original: (result >> 40) as f32 * 2^-24 < probability
-            // Equivalent: (result >> 40) < probability * 2^24  (= prob_threshold)
-            //
-            // _mm256_cmpgt_epi64(thresh_v, top24): each lane is all-1s when
-            //   thresh > top24[i] (signed, but both values are in [0, 2^24) so
-            //   signed == unsigned here). Sign-bit of all-1s lane is 1.
-            // _mm256_movemask_pd then extracts one bit per 64-bit lane -> 4-bit mask.
             let top24    = _mm256_srli_epi64(result, 40);
             let thresh_v = _mm256_set1_epi64x(prob_threshold as i64);
             let cmp      = _mm256_cmpgt_epi64(thresh_v, top24);
             let bedrock_mask = _mm256_movemask_pd(_mm256_castsi256_pd(cmp)) as u8;
 
-            // Reconcile with what the block expects.
-            if should_be_bedrock { bedrock_mask } else { !bedrock_mask & 0x0F }
+            // Branchless inversion via precomputed XOR mask (optimisation 12).
+            // active_lo/hi are initialised to 0x0F, so the AND with `active`
+            // in the caller naturally clears the upper bits produced by
+            // XOR-ing with 0xFF — no extra `& 0x0F` needed.
+            bedrock_mask ^ sbb_xor
         }
     }
 
@@ -593,6 +639,7 @@ mod simd_avx2 {
     ///
     /// # Safety
     /// Requires AVX2.  Caller must have verified `is_x86_feature_detected!("avx2")`.
+    #[inline]
     #[target_feature(enable = "avx2")]
     pub unsafe fn fill_group_uniform(
         x_g: i32, z_g: i32,
@@ -639,6 +686,7 @@ mod simd_avx2 {
     ///
     /// # Safety
     /// Requires AVX2.  Caller must have verified `is_x86_feature_detected!("avx2")`.
+    #[inline]
     #[target_feature(enable = "avx2")]
     pub unsafe fn check_formation_x8_avx2(
         positions_x: &[i32], // exactly 8 entries (contiguous i32 array)
@@ -671,32 +719,63 @@ mod simd_avx2 {
             // so the per-position ox*K multiply is computed once here; inside the
             // loop only a cheap _mm_add_epi32 with the precomputed bx*K
             // (Blocks::bx_hash_term) is needed.  The i32 sum is sign-extended to
-            // i64 inside math_hash_x4, matching Java's `(long)(x * 3129871)`.
+            // i64 inside math_hash_x4_precomputed, matching Java's `(long)(x * 3129871)`.
             let k_x = _mm_set1_epi32(3_129_871_i32);
             let ox_lo_term = _mm_mullo_epi32(ox_lo, k_x); // 4 * i32, wrapping
             let ox_hi_term = _mm_mullo_epi32(ox_hi, k_x); // 4 * i32, wrapping
 
+            // Hoist oz * K_z out of the block loop (Flaw 1 fix).
+            //
+            // Mirrors the AVX-512 path: sign-extend the i32 oz values to i64 and
+            // multiply by K_z = 116_129_781 once before the loop.  Inside the loop
+            // only a cheap _mm256_add_epi64 with the precomputed bz_hash_term is
+            // needed.  Both oz and K_z fit in i32, so the full i64 product is exact.
+            let k_z = _mm256_set1_epi64x(116_129_781_i64);
+            let oz_lo_i64    = _mm256_cvtepi32_epi64(oz_lo);       // 4 * i64
+            let oz_hi_i64    = _mm256_cvtepi32_epi64(oz_hi);       // 4 * i64
+            let oz_lo_z_term = mullo_epi64(oz_lo_i64, k_z);        // hoisted oz*K_z (lo half)
+            let oz_hi_z_term = mullo_epi64(oz_hi_i64, k_z);        // hoisted oz*K_z (hi half)
+
             // Single block loop — N iterations instead of 2N.
-            // Both halves are updated together; each SoA field (bx_hash_term, z,
-            // y, prob_threshold, should_be_bedrock) is fetched once per block.
-            for i in 0..blocks.len() {
+            // Both halves are updated together; each SoA field (bx_hash_term,
+            // bz_hash_term, y, prob_threshold, sbb_xor) is fetched once per block.
+            //
+            // Optimisation 11: extract all five SoA slices before the loop so LLVM
+            // can prove they are all of equal length `n` and hoist the five
+            // independent bounds checks out of the loop entirely (mirrors the
+            // "Flaw 5 fix" already applied to the scalar `check_formation`).
+            let bx_s  = &blocks.bx_hash_term[..];
+            let bz_s  = &blocks.bz_hash_term[..];
+            let y_s   = &blocks.y[..];
+            let thr_s = &blocks.prob_threshold[..];
+            let sbb_s = &blocks.sbb_xor[..];
+            let n     = bx_s.len();
+            assert_eq!(n, bz_s.len(),  "Blocks field length mismatch: bz_hash_term");
+            assert_eq!(n, y_s.len(),   "Blocks field length mismatch: y");
+            assert_eq!(n, thr_s.len(), "Blocks field length mismatch: prob_threshold");
+            assert_eq!(n, sbb_s.len(), "Blocks field length mismatch: sbb_xor");
+
+            for i in 0..n {
                 // x_term: ox*K (hoisted) + bx*K (per block), all in i32 wrapping space.
-                // sign-extension to i64 happens inside math_hash_x4 / is_bedrock_x4.
-                let bx_k = _mm_set1_epi32(blocks.bx_hash_term[i]);
+                // sign-extension to i64 happens inside math_hash_x4_precomputed.
+                let bx_k = _mm_set1_epi32(bx_s[i]);
                 let x_lo = _mm_add_epi32(ox_lo_term, bx_k);
                 let x_hi = _mm_add_epi32(ox_hi_term, bx_k);
 
-                let bz = _mm_set1_epi32(blocks.z[i]);
-                let z_lo = _mm_add_epi32(oz_lo, bz);
-                let z_hi = _mm_add_epi32(oz_hi, bz);
+                // term_z: hoisted oz*K_z + precomputed bz*K_z (from bz_hash_term).
+                // Replaces the per-block cvtepi32_epi64 + mul_epi32 pair that
+                // previously executed on every block iteration.
+                let bz_term    = _mm256_set1_epi64x(bz_s[i]);
+                let term_z_lo  = _mm256_add_epi64(oz_lo_z_term, bz_term);
+                let term_z_hi  = _mm256_add_epi64(oz_hi_z_term, bz_term);
 
                 // Fetch the per-block scalars once; share across both SIMD calls.
-                let y   = blocks.y[i];
-                let thr = blocks.prob_threshold[i];
-                let sbb = blocks.should_be_bedrock[i];
+                let y   = y_s[i];
+                let thr = thr_s[i];
+                let sbb = sbb_s[i]; // 0x00 = bedrock expected, 0xFF = non-bedrock
 
-                active_lo &= is_bedrock_x4(dlo, dhi, x_lo, y, z_lo, thr, sbb);
-                active_hi &= is_bedrock_x4(dlo, dhi, x_hi, y, z_hi, thr, sbb);
+                active_lo &= is_bedrock_x4_precomputed(dlo, dhi, x_lo, y, term_z_lo, thr, sbb);
+                active_hi &= is_bedrock_x4_precomputed(dlo, dhi, x_hi, y, term_z_hi, thr, sbb);
 
                 // Early exit: both halves have eliminated all their lanes.
                 if (active_lo | active_hi) == 0 { return 0; }
@@ -782,13 +861,13 @@ mod simd_avx512 {
     #[target_feature(enable = "avx512f,avx512dq,avx2")]
     #[inline]
     unsafe fn is_bedrock_x8(
-        dlo:               i64,
-        dhi:               i64,
-        term_x:            __m512i,  // 8 * i64: (ox+bx)*K_x as i32, sign-extended
-        y:                 i32,
-        term_z:            __m512i,  // 8 * i64: oz*K_z + bz_hash_term per lane (z hoisting is safe)
-        prob_threshold:    u64,
-        should_be_bedrock: bool,
+        dlo:            i64,
+        dhi:            i64,
+        term_x:         __m512i,  // 8 * i64: (ox+bx)*K_x as i32, sign-extended
+        y:              i32,
+        term_z:         __m512i,  // 8 * i64: oz*K_z + bz_hash_term per lane
+        prob_threshold: u64,
+        sbb_xor:        u8,       // 0x00 = bedrock expected, 0xFF = non-bedrock expected
     ) -> u8 {
         // SAFETY: caller guarantees AVX-512F, AVX-512DQ, and AVX2 are available
         // (enforced by #[target_feature]).
@@ -819,7 +898,10 @@ mod simd_avx512 {
             let thresh: __m512i = _mm512_set1_epi64(prob_threshold as i64);
             let bedrock_mask: u8 = _mm512_cmpgt_epu64_mask(thresh, top24);
 
-            if should_be_bedrock { bedrock_mask } else { !bedrock_mask }
+            // Branchless inversion via precomputed XOR mask (optimisation 12).
+            // sbb_xor == 0x00 → bedrock expected → pass mask = bedrock_mask.
+            // sbb_xor == 0xFF → non-bedrock expected → pass mask = !bedrock_mask.
+            bedrock_mask ^ sbb_xor
         }
     }
 
@@ -828,6 +910,7 @@ mod simd_avx512 {
     ///
     /// # Safety
     /// Requires AVX-512F + AVX-512DQ.  Caller must have verified feature support.
+    #[inline]
     #[target_feature(enable = "avx512f,avx512dq,avx2")]
     pub unsafe fn check_formation_x8(
         positions_x: &[i32], // exactly 8 entries (contiguous i32 array)
@@ -869,20 +952,35 @@ mod simd_avx512 {
 
             let mut active: u8 = 0xFF; // bits 0-7 all set = all lanes in play
 
-            // SoA hot loop: prob_threshold, should_be_bedrock, y, bx_hash_term,
+            // Optimisation 11: extract all five SoA slices before the loop so LLVM
+            // can prove they are all of equal length `n` and hoist the five
+            // independent bounds checks out of the loop entirely (mirrors the
+            // "Flaw 5 fix" already applied to the scalar `check_formation`).
+            // SoA hot loop: prob_threshold, sbb_xor, y, bx_hash_term,
             // and bz_hash_term each live in separate contiguous streams.
-            for i in 0..blocks.len() {
+            let bx_s  = &blocks.bx_hash_term[..];
+            let bz_s  = &blocks.bz_hash_term[..];
+            let y_s   = &blocks.y[..];
+            let thr_s = &blocks.prob_threshold[..];
+            let sbb_s = &blocks.sbb_xor[..];
+            let n     = bx_s.len();
+            assert_eq!(n, bz_s.len(),  "Blocks field length mismatch: bz_hash_term");
+            assert_eq!(n, y_s.len(),   "Blocks field length mismatch: y");
+            assert_eq!(n, thr_s.len(), "Blocks field length mismatch: prob_threshold");
+            assert_eq!(n, sbb_s.len(), "Blocks field length mismatch: sbb_xor");
+
+            for i in 0..n {
                 // term_x: ox*K (hoisted, i32) + bx*K (per block, i32), then sign-extend.
                 // All arithmetic stays in i32 wrapping space until cvtepi32_epi64,
                 // matching Java's `(long)(x * 3129871)` semantics exactly.
-                let abs_x_i32 = _mm256_add_epi32(ox_term_i32, _mm256_set1_epi32(blocks.bx_hash_term[i])); // i32 add ✓
-                let term_x    = _mm512_cvtepi32_epi64(abs_x_i32);                                          // sign-extend ✓
+                let abs_x_i32 = _mm256_add_epi32(ox_term_i32, _mm256_set1_epi32(bx_s[i])); // i32 add ✓
+                let term_x    = _mm512_cvtepi32_epi64(abs_x_i32);                           // sign-extend ✓
 
                 // term_z: z stays 64-bit throughout, so the hoisted oz_term_v +
                 // per-block bz_hash_term addition is correct.
-                let term_z = _mm512_add_epi64(oz_term_v, _mm512_set1_epi64(blocks.bz_hash_term[i]));
+                let term_z = _mm512_add_epi64(oz_term_v, _mm512_set1_epi64(bz_s[i]));
 
-                let passed = is_bedrock_x8(dlo, dhi, term_x, blocks.y[i], term_z, blocks.prob_threshold[i], blocks.should_be_bedrock[i]);
+                let passed = is_bedrock_x8(dlo, dhi, term_x, y_s[i], term_z, thr_s[i], sbb_s[i]);
                 active &= passed;
                 if active == 0 { return 0; }
             }
@@ -972,21 +1070,6 @@ fn coords_from_lj(l: i64, j: i64) -> (i64, i64) {
         let o = j - (6*l - 1);
         (-l + o, -l)
     }
-}
-
-#[inline]
-fn spiral_coords(k: i64, start_x: i32, start_z: i32) -> (i32, i32) {
-    if k == 0 { return (start_x, start_z); }
-
-    // Shell containing index k.  l = floor((1 + sqrt(k)) / 2).
-    // The float approximation is exact for all k ≤ 2^52 (≫ any realistic search).
-    let l = ((1.0 + (k as f64).sqrt()) * 0.5) as i64;
-    // Guard against rounding: adjust by ±1 if needed.
-    let l = if 4*l*l + 4*l < k { l + 1 } else if 4*l*l - 4*l + 1 > k { l - 1 } else { l };
-
-    let j = k - (4*l*l - 4*l + 1); // offset within shell [0, 8L)
-    let (dx, dz) = coords_from_lj(l, j);
-    (start_x + dx as i32, start_z + dz as i32)
 }
 
 /// Like `spiral_coords` but also returns the shell `l`, intra-shell offset `j`,
@@ -1140,22 +1223,26 @@ where
         let chunk_end_j = j + GROUPS_PER_CHUNK as i64 * 8;
         let uniform = l > 0 && chunk_end_j < next_leg_j && chunk_end_j < 8 * l;
 
-        for _ in 0..GROUPS_PER_CHUNK {
-            if uniform {
-                // Fast path: entire chunk lies within one leg — direction is constant.
+        if uniform {
+            // Fast path: entire chunk lies within one leg — direction is constant.
+            // Branch hoisted out of the loop so the inner loop contains only the
+            // uniform fill, with no dead code or repeated branch evaluation.
+            for _ in 0..GROUPS_PER_CHUNK {
                 uniform_fill(x, z, dx, dz, &mut xs, &mut zs);
                 x += 8 * dx;
                 z += 8 * dz;
-                j += 8;
-            } else {
+                if check_group(&xs, &zs) { return true; }
+            }
+        } else {
+            for _ in 0..GROUPS_PER_CHUNK {
                 fill_group_from_state(
                     &mut x, &mut z, &mut l, &mut j,
                     &mut dx, &mut dz, &mut next_leg_j,
                     &mut xs, &mut zs,
                     start_x, start_z,
                 );
+                if check_group(&xs, &zs) { return true; }
             }
-            if check_group(&xs, &zs) { return true; }
         }
         false
     })
@@ -1180,10 +1267,10 @@ fn main() -> iced::Result {
 /// then normalise so the minimum X and Z coordinates are both 0.
 ///
 /// Rotation formulae (standard 2-D, with X east and Z south):
-///   0º -> (x,  z)
-///   1* CW  ->  (−z,  x)
-///   2* CW  ->  (−x, −z)
-///   3* CW  ->  ( z, −x)
+///   0º  -> (x,  z)
+///   1× CW  ->  (−z,  x)
+///   2× CW  ->  (−x, −z)
+///   3× CW  ->  ( z, −x)
 fn rotate_blocks(blocks: &[Block], times_cw: u8) -> Vec<Block> {
     if blocks.is_empty() { return vec![]; }
     let transformed: Vec<(i32, i32)> = blocks.iter().map(|b| {
@@ -1408,6 +1495,45 @@ fn run_search(
                 .any(|(&cx, &cz)| check_formation(cx, cz, dlo, dhi, &blocks))
         };
 
+        // Named wrapper functions so that #[target_feature] can be applied —
+        // the attribute is not permitted on closures in stable Rust.  Each wrapper
+        // carries the required target-feature set, allowing the compiler to inline
+        // the SIMD kernel into a call site that shares the same feature context.
+        // The thin closures below delegate to these wrappers; because the wrappers
+        // are #[inline] the compiler sees through the closure boundary.
+        #[cfg(target_arch = "x86_64")]
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn avx2_fill(
+            x: i32, z: i32, dx: i32, dz: i32,
+            xs: &mut [i32; 8], zs: &mut [i32; 8],
+        ) {
+            // SAFETY: caller guarantees AVX2 is available.
+            unsafe { simd_avx2::fill_group_uniform(x, z, dx, dz, xs, zs); }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        #[inline]
+        #[target_feature(enable = "avx512f,avx512dq,avx2")]
+        unsafe fn avx512_check(
+            xs: &[i32; 8], zs: &[i32; 8],
+            dlo: i64, dhi: i64, blocks: &Blocks,
+        ) -> bool {
+            // SAFETY: caller guarantees AVX-512F+DQ is available.
+            unsafe { simd_avx512::check_formation_x8(xs, zs, dlo, dhi, blocks) != 0 }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn avx2_check(
+            xs: &[i32; 8], zs: &[i32; 8],
+            dlo: i64, dhi: i64, blocks: &Blocks,
+        ) -> bool {
+            // SAFETY: caller guarantees AVX2 is available.
+            unsafe { simd_avx2::check_formation_x8_avx2(xs, zs, dlo, dhi, blocks) != 0 }
+        }
+
         let found_chunk: Option<i64> = match simd {
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx512 => run_chunk_batch(
@@ -1415,11 +1541,11 @@ fn run_search(
                 &|x: i32, z: i32, dx: i32, dz: i32,
                   xs: &mut [i32; 8], zs: &mut [i32; 8]| {
                     // SAFETY: AVX2 was verified by detect_simd (AVX-512 ⟹ AVX2).
-                    unsafe { simd_avx2::fill_group_uniform(x, z, dx, dz, xs, zs); }
+                    unsafe { avx2_fill(x, z, dx, dz, xs, zs); }
                 },
                 &|xs: &[i32; 8], zs: &[i32; 8]| {
                     // SAFETY: AVX-512F+DQ verified by detect_simd.
-                    unsafe { simd_avx512::check_formation_x8(xs, zs, dlo, dhi, &blocks) != 0 }
+                    unsafe { avx512_check(xs, zs, dlo, dhi, &blocks) }
                 },
             ),
             #[cfg(target_arch = "x86_64")]
@@ -1428,11 +1554,11 @@ fn run_search(
                 &|x: i32, z: i32, dx: i32, dz: i32,
                   xs: &mut [i32; 8], zs: &mut [i32; 8]| {
                     // SAFETY: AVX2 verified by detect_simd.
-                    unsafe { simd_avx2::fill_group_uniform(x, z, dx, dz, xs, zs); }
+                    unsafe { avx2_fill(x, z, dx, dz, xs, zs); }
                 },
                 &|xs: &[i32; 8], zs: &[i32; 8]| {
                     // SAFETY: AVX2 verified by detect_simd.
-                    unsafe { simd_avx2::check_formation_x8_avx2(xs, zs, dlo, dhi, &blocks) != 0 }
+                    unsafe { avx2_check(xs, zs, dlo, dhi, &blocks) }
                 },
             ),
             _ => run_chunk_batch(batch_base, start_x, start_z, &scalar_fill, &scalar_check),
@@ -1458,11 +1584,11 @@ fn run_search(
                 let hit = xs.iter().zip(zs.iter())
                     .any(|(&cx, &cz)| check_formation(cx, cz, dlo, dhi, &blocks));
                 if hit {
-                    let group_base_k = (chunk_base_group + g) * 8;
-                    for p in 0..8i64 {
-                        let (cx, cz) = spiral_coords(group_base_k + p, start_x, start_z);
-                        if check_formation(cx, cz, dlo, dhi, &blocks) {
-                            return Ok(Some((cx, cz)));
+                    // xs and zs are already populated by fill_group_from_state above —
+                    // no need to recompute positions via spiral_coords (which calls sqrt).
+                    for p in 0..8usize {
+                        if check_formation(xs[p], zs[p], dlo, dhi, &blocks) {
+                            return Ok(Some((xs[p], zs[p])));
                         }
                     }
                     // The scalar group scan confirmed a hit above but no individual
@@ -1786,13 +1912,14 @@ impl Application for App {
                         for col in 0..self.grid_cols {
                             let state = self.grid_cells[y_idx][row][col];
                             if state == CellState::Unknown { continue; }
+                            let prob = compute_probability(y, bt);
                             blocks_vec.push(Block {
                                 x: offset_x + col as i32,
                                 y,
                                 z: offset_z + row as i32,
                                 should_be_bedrock: state == CellState::Bedrock,
-                                probability:    compute_probability(y, bt),
-                                prob_threshold: prob_to_threshold(compute_probability(y, bt)),
+                                probability:    prob,
+                                prob_threshold: prob_to_threshold(prob),
                             });
                         }
                     }
@@ -1885,14 +2012,19 @@ impl Application for App {
                                 //   2. User/early cancellation (Ok(None))
                                 //   3. Last impossible-pattern error (Err(_))
                                 let mut last: Result<Option<(i32, i32)>, String> = Ok(None);
+                                let mut saw_cancellation = false;
                                 for r in results {
                                     match r {
                                         Ok(Some(_)) => return r,           // found; done
-                                        Ok(None)    => { last = Ok(None); } // cancelled
+                                        Ok(None)    => { saw_cancellation = true; last = Ok(None); } // cancelled
                                         Err(e)      => {
                                             // Only downgrade to an error if we
                                             // have no cancellation to report yet.
-                                            if matches!(last, Ok(None)) {
+                                            // Note: `last` is initialised to Ok(None) but
+                                            // that sentinel must not be confused with a
+                                            // real cancellation, so we track the latter
+                                            // separately with `saw_cancellation`.
+                                            if !saw_cancellation {
                                                 last = Err(e);
                                             }
                                         }
@@ -2144,7 +2276,7 @@ impl Application for App {
 
         let zoom_row = row![
             text(format!("Zoom: {:.0}%", self.ui_scale * 100.0)).size(sc(12.0) as u16),
-            Space::with_width(Length::Fixed(8.0)),
+            Space::with_width(Length::Fixed(sc(8.0))),
             button(text("−").size(sc(14.0) as u16))
                 .on_press(Message::ZoomOut)
                 .style(theme::Button::Secondary)
@@ -2153,7 +2285,7 @@ impl Application for App {
                 .on_press(Message::ZoomIn)
                 .style(theme::Button::Secondary)
                 .padding([sc(3.0) as u16, sc(10.0) as u16]),
-        ].spacing(4).align_items(Alignment::Center);
+        ].spacing(sc(4.0) as u16).align_items(Alignment::Center);
 
         let content = Column::new()
             .spacing(sc(2.0) as u16)
@@ -2187,8 +2319,6 @@ impl Application for App {
             .push(Space::with_height(Length::Fixed(sc(6.0))))
             .push(all_rotations_row)
             .push(Space::with_height(Length::Fixed(sc(6.0))))
-            // .push(horizontal_rule(1))
-            // .push(Space::with_height(Length::Fixed(12.0)))
             .push(
                 container(row![search_btn, cancel_btn].spacing(16).align_items(Alignment::Center))
                     .width(Length::Fill)
