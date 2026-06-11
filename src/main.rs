@@ -5,6 +5,7 @@
 /// Example: bedrockformation 124352345 0:0 floor 0,-63,0:1 1,-62,0:1 0,-63,1:0
 
 use std::sync::{Arc, atomic::{AtomicBool, AtomicI64, Ordering}};
+use smallvec::SmallVec;
 use rayon::prelude::*;
 
 use iced::{
@@ -62,6 +63,38 @@ const _: () = assert!(
     GROUPS_PER_BATCH % GROUPS_PER_CHUNK == 0,
     "GROUPS_PER_BATCH must be divisible by GROUPS_PER_CHUNK",
 );
+
+/// Compute how many chunks to dispatch in a single `into_par_iter().find_first()` call.
+///
+/// Two problems are solved together:
+///
+/// **(a) Rayon re-entry overhead** — each `find_first` invocation pays for task-graph
+/// setup, work-stealing initialisation, and join synchronisation.  For a 100 M-position
+/// search the original one-batch-per-call loop triggered ~100 of these round-trips
+/// (~1 ms each).  Dispatching 16× as many chunks per call reduces that overhead 16×
+/// while keeping individual chunks small (each chunk ≈ 8 192 positions ≈ a few µs),
+/// so cancel responsiveness is unchanged.
+///
+/// **(b) High-core-count load balance** — on machines with > 32 logical cores the
+/// original `CHUNKS_PER_BATCH = 128` gave fewer than 4 tasks/core, leaving workers
+/// idle at the tail of each `find_first` due to early termination.  The formula
+/// `max(16 × CHUNKS_PER_BATCH, nextpow2(4 × num_threads))` restores ≥ 4 tasks/core
+/// on any machine without affecting the common ≤ 32-core case.
+///
+/// Called once at the start of `run_search` so the Rayon pool query is not repeated
+/// inside the search loop.
+fn compute_super_batch_chunks() -> i64 {
+    let threads = rayon::current_num_threads() as i64;
+    // 4 chunks/thread: enough for work-stealing to keep every core busy.
+    let for_balance  = threads.saturating_mul(4);
+    // 16× the original static batch size to amortise Rayon setup cost.
+    let for_batching = CHUNKS_PER_BATCH * 16;
+    let target = for_balance.max(for_batching);
+    // Round up to the nearest power of two (executes once at startup).
+    let mut cpb = 1_i64;
+    while cpb < target { cpb <<= 1; }
+    cpb
+}
 
 // Bedrock type 
 
@@ -325,6 +358,24 @@ struct Blocks {
     /// Used by the AVX-512 and AVX2 kernels to replace a per-block mullo with
     /// a cheaper add in the hot loop.
     bx_hash_term:      AlignedVec<i32>,
+    /// `Some(y)` when every block in this set shares the same Y layer
+    /// (e.g. all constraints come from y = −60).  Used by the hot-path kernels
+    /// to hoist the per-block y broadcast **outside** the block loop.
+    ///
+    /// The compiler cannot prove loop-invariance from the SoA slice alone —
+    /// every `y_s[i]` access looks like a distinct load — so the hoist must be
+    /// explicit.  When `None`, kernels fall back to loading `y_s[i]` per
+    /// iteration as before.
+    uniform_y: Option<i32>,
+    /// `Some(t)` when every block shares the same `prob_threshold`.
+    ///
+    /// This is always true when `uniform_y` is `Some`, because the threshold
+    /// depends only on the Y layer and bedrock type, not on block position.
+    /// For example, all y = −60 Floor blocks have threshold
+    /// `(0.2 × 2²⁴) as u64 = 3_355_443` regardless of `should_be_bedrock`.
+    /// Allows the SIMD threshold-broadcast vector to be computed once before
+    /// the block loop instead of once per block.
+    uniform_threshold: Option<u64>,
 }
 
 impl Blocks {
@@ -358,12 +409,37 @@ impl Blocks {
             // once before the block loop; inside the loop only a cheap i32 add is needed.
             bxs.push(b.x.wrapping_mul(3_129_871_i32));
         }
+        // Construction-time invariant: every SoA field must have the same length.
+        // These asserts fire exactly once per Blocks construction (called once in
+        // run_search before the search loop begins), so they are cheap.  Moving
+        // the checks here — rather than repeating them inside each hot-path kernel
+        // (~131K calls per batch) — lets the in-kernel checks be debug_assert_eq!,
+        // which compile to nothing in release builds and are retained in debug builds.
+        assert_eq!(n, sbbs.len(),  "Blocks field length mismatch: sbb_xor");
+        assert_eq!(n, thrs.len(),  "Blocks field length mismatch: prob_threshold");
+        assert_eq!(n, bzs.len(),   "Blocks field length mismatch: bz_hash_term");
+        assert_eq!(n, bxs.len(),   "Blocks field length mismatch: bx_hash_term");
+
+        // Detect whether all blocks share the same Y layer and/or probability
+        // threshold.  For the primary y=−60 use case every block has y=−60 and
+        // threshold=(0.2×2²⁴)=3_355_443, so both are `Some`.  The hot-path
+        // kernels use these cached scalars to hoist broadcasts out of the block
+        // loop — the compiler cannot prove loop-invariance from SoA slices alone.
+        let uniform_y = if n == 0 { None }
+            else if ys.windows(2).all(|w| w[0] == w[1]) { Some(ys[0]) }
+            else { None };
+        let uniform_threshold = if n == 0 { None }
+            else if thrs.windows(2).all(|w| w[0] == w[1]) { Some(thrs[0]) }
+            else { None };
+
         Self {
             y:            AlignedVec::from_slice(&ys),
             sbb_xor:      AlignedVec::from_slice(&sbbs),
             prob_threshold: AlignedVec::from_slice(&thrs),
             bz_hash_term: AlignedVec::from_slice(&bzs),
             bx_hash_term: AlignedVec::from_slice(&bxs),
+            uniform_y,
+            uniform_threshold,
         }
     }
 }
@@ -411,18 +487,32 @@ fn check_formation(ox: i32, oz: i32, dlo: i64, dhi: i64, blocks: &Blocks) -> boo
     let thr_s = &blocks.prob_threshold[..];
     let sbb_s = &blocks.sbb_xor[..];
     let n     = bx_s.len();
-    // One assertion gives LLVM the length-parity proof for all five arrays.
-    assert_eq!(n, bz_s.len(),  "Blocks field length mismatch: bz_hash_term");
-    assert_eq!(n, y_s.len(),   "Blocks field length mismatch: y");
-    assert_eq!(n, thr_s.len(), "Blocks field length mismatch: prob_threshold");
-    assert_eq!(n, sbb_s.len(), "Blocks field length mismatch: sbb_xor");
+    // Construction-time asserts in Blocks::from_vec guarantee all five fields
+    // have equal length; these debug_assert_eq! calls vanish in release builds
+    // while retaining the bounds-check-hoist hint for LLVM (the compiler can
+    // still prove equality from the known-n slices extracted above).
+    debug_assert_eq!(n, bz_s.len(),  "Blocks field length mismatch: bz_hash_term");
+    debug_assert_eq!(n, y_s.len(),   "Blocks field length mismatch: y");
+    debug_assert_eq!(n, thr_s.len(), "Blocks field length mismatch: prob_threshold");
+    debug_assert_eq!(n, sbb_s.len(), "Blocks field length mismatch: sbb_xor");
+
+    // Hoist uniform y and threshold outside the block loop.  The compiler
+    // cannot prove loop-invariance from SoA array accesses alone.  When all
+    // blocks are at the same Y layer (e.g. y=−60), both values are `Some` and
+    // the loop body avoids two slice loads per iteration.
+    let fixed_y_i64: Option<i64> = blocks.uniform_y.map(|y| y as i64);
+    let fixed_thr:   Option<u64> = blocks.uniform_threshold;
 
     for i in 0..n {
         // x: (ox + bx)*K in i32 space, sign-extended to i64 (matches Java semantics)
         let term_x = ox_i32_term.wrapping_add(bx_s[i]) as i64;
         // z: true i64 multiply, distributive in 64-bit space
         let term_z = oz_i64_term.wrapping_add(bz_s[i]);
-        let mut l = term_x ^ term_z ^ (y_s[i] as i64);
+        // Use the cached constant when all blocks share the same Y layer;
+        // otherwise fall back to the per-block SoA load.  LLVM hoists the
+        // Option discriminant check out of the loop (it is loop-invariant).
+        let y_i64 = fixed_y_i64.unwrap_or_else(|| y_s[i] as i64);
+        let mut l = term_x ^ term_z ^ y_i64;
         // Factored two-multiply form (optimization 1): l*(l*K + 11) = l²*K + l*11
         let inner = l.wrapping_mul(42_317_861_i64).wrapping_add(11_i64);
         l = l.wrapping_mul(inner);
@@ -430,7 +520,8 @@ fn check_formation(ox: i32, oz: i32, dlo: i64, dhi: i64, blocks: &Blocks) -> boo
         let s0 = (hash ^ dlo) as u64;
         let s1 = dhi as u64;
         let result = s0.wrapping_add(s1).rotate_left(17).wrapping_add(s0);
-        let is_bed = (result >> 40) < thr_s[i];
+        let thr_i = fixed_thr.unwrap_or_else(|| thr_s[i]);
+        let is_bed = (result >> 40) < thr_i;
         // sbb_xor encoding: 0x00 = should be bedrock, 0xFF = should be non-bedrock.
         let sbb = sbb_s[i] == 0;
         if sbb != is_bed { return false; }
@@ -439,6 +530,51 @@ fn check_formation(ox: i32, oz: i32, dlo: i64, dhi: i64, blocks: &Blocks) -> boo
 }
 
 fn clamp01(v: f64) -> f64 { v.clamp(0.0, 1.0) }
+
+/// Scalar formation check with pre-computed position terms (optimisation 2).
+///
+/// Accepts `ox_i32_term` and `oz_i64_term` already computed by the caller,
+/// eliminating the two multiplications that would otherwise be re-executed for
+/// every rotation when `search_all_rotations` is active on a non-SIMD machine.
+#[inline(always)]
+fn check_formation_with_terms(
+    ox_i32_term: i32,
+    oz_i64_term: i64,
+    dlo: i64,
+    dhi: i64,
+    blocks: &Blocks,
+) -> bool {
+    debug_assert_ne!(dhi, 0, "deriver hi seed must be non-zero");
+    let bx_s  = &blocks.bx_hash_term[..];
+    let bz_s  = &blocks.bz_hash_term[..];
+    let y_s   = &blocks.y[..];
+    let thr_s = &blocks.prob_threshold[..];
+    let sbb_s = &blocks.sbb_xor[..];
+    let n     = bx_s.len();
+    debug_assert_eq!(n, bz_s.len(),  "Blocks field length mismatch: bz_hash_term");
+    debug_assert_eq!(n, y_s.len(),   "Blocks field length mismatch: y");
+    debug_assert_eq!(n, thr_s.len(), "Blocks field length mismatch: prob_threshold");
+    debug_assert_eq!(n, sbb_s.len(), "Blocks field length mismatch: sbb_xor");
+    let fixed_y_i64: Option<i64> = blocks.uniform_y.map(|y| y as i64);
+    let fixed_thr:   Option<u64> = blocks.uniform_threshold;
+    for i in 0..n {
+        let term_x = ox_i32_term.wrapping_add(bx_s[i]) as i64;
+        let term_z = oz_i64_term.wrapping_add(bz_s[i]);
+        let y_i64  = fixed_y_i64.unwrap_or_else(|| y_s[i] as i64);
+        let mut l  = term_x ^ term_z ^ y_i64;
+        let inner  = l.wrapping_mul(42_317_861_i64).wrapping_add(11_i64);
+        l = l.wrapping_mul(inner);
+        let hash   = l >> 16;
+        let s0     = (hash ^ dlo) as u64;
+        let s1     = dhi as u64;
+        let result = s0.wrapping_add(s1).rotate_left(17).wrapping_add(s0);
+        let thr_i  = fixed_thr.unwrap_or_else(|| thr_s[i]);
+        let is_bed = (result >> 40) < thr_i;
+        let sbb    = sbb_s[i] == 0;
+        if sbb != is_bed { return false; }
+    }
+    true
+}
 
 // SIMD kernel (AVX2, x86-64 only) 
 //
@@ -666,125 +802,101 @@ mod simd_avx2 {
         }
     }
 
-    /// Fused 8-position formation check for AVX2 machines.
+    /// Precompute the position-dependent hash terms for 8 spiral positions (AVX2 path).
     ///
-    /// Processes all 8 spiral positions in **one** block-loop pass using two
-    /// `__m128i` register pairs (lo = positions 0–3, hi = positions 4–7),
-    /// halving the block-loop iterations compared to calling `check_formation_x4`
-    /// twice.
-    ///
-    /// # Mask layout
-    /// Bits 0–3 correspond to positions 0–3; bits 4–7 to positions 4–7.
-    /// A set bit means that position passes the full formation check.
-    ///
-    /// # Early-exit logic
-    /// Two independent 4-bit nibbles (`active_lo`, `active_hi`) track which
-    /// lanes are still in play.  The loop terminates as soon as
-    /// `active_lo | active_hi == 0`, i.e. no lane in either half can still
-    /// match — mirroring the scalar `.all()` short-circuit across both halves
-    /// in a single combined test.
+    /// Returns `(ox_lo_term, ox_hi_term, oz_lo_z_term, oz_hi_z_term)` — the hoisted
+    /// x and z multiplications for each 4-wide half that depend only on `(xs, zs)`.
+    /// When multiple rotations are checked for the same group, call this once and
+    /// forward the results to `check_formation_x8_avx2_with_terms` to avoid recomputing
+    /// the same four SIMD multiplications for every rotation.
     ///
     /// # Safety
-    /// Requires AVX2.  Caller must have verified `is_x86_feature_detected!("avx2")`.
-    #[inline]
+    /// Requires AVX2.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn check_formation_x8_avx2(
-        positions_x: &[i32], // exactly 8 entries (contiguous i32 array)
-        positions_z: &[i32], // exactly 8 entries (contiguous i32 array)
-        dlo:    i64,
-        dhi:    i64,
-        blocks: &super::Blocks,
-    ) -> u8 {
-        debug_assert_eq!(positions_x.len(), 8);
-        debug_assert_eq!(positions_z.len(), 8);
-
-        // SAFETY: caller guarantees AVX2 is available (enforced by #[target_feature]).
+    #[inline]
+    pub unsafe fn position_terms_x8_avx2(
+        positions_x: &[i32; 8],
+        positions_z: &[i32; 8],
+    ) -> (__m128i, __m128i, __m256i, __m256i) {
+        // SAFETY: caller guarantees AVX2 is available.
         unsafe {
-            // Load both halves of the position arrays.  Each _mm_loadu_si128 pulls
-            // 4 * i32 from a contiguous slice; lane 0 = lowest address.
             let ox_lo = _mm_loadu_si128(positions_x[..4].as_ptr() as *const __m128i);
             let oz_lo = _mm_loadu_si128(positions_z[..4].as_ptr() as *const __m128i);
             let ox_hi = _mm_loadu_si128(positions_x[4..].as_ptr() as *const __m128i);
             let oz_hi = _mm_loadu_si128(positions_z[4..].as_ptr() as *const __m128i);
 
-            // active_lo: bits 0-3 = lanes 0-3 still in play
-            // active_hi: bits 0-3 = lanes 4-7 still in play (stored in low nibble here)
+            let k_x = _mm_set1_epi32(3_129_871_i32);
+            let ox_lo_term = _mm_mullo_epi32(ox_lo, k_x);
+            let ox_hi_term = _mm_mullo_epi32(ox_hi, k_x);
+
+            let k_z = _mm256_set1_epi64x(116_129_781_i64);
+            let oz_lo_i64    = _mm256_cvtepi32_epi64(oz_lo);
+            let oz_hi_i64    = _mm256_cvtepi32_epi64(oz_hi);
+            let oz_lo_z_term = mullo_epi64(oz_lo_i64, k_z);
+            let oz_hi_z_term = mullo_epi64(oz_hi_i64, k_z);
+
+            (ox_lo_term, ox_hi_term, oz_lo_z_term, oz_hi_z_term)
+        }
+    }
+
+    /// Inner AVX2 formation check with pre-computed position terms (optimisation 2).
+    ///
+    /// Accepts the four hoisted terms from `position_terms_x8_avx2`, eliminating the
+    /// four SIMD multiplications that would otherwise be re-executed for every rotation
+    /// when `search_all_rotations` is active.
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn check_formation_x8_avx2_with_terms(
+        ox_lo_term:   __m128i, // 4 * i32: ox[0..4]*K_x, wrapping
+        ox_hi_term:   __m128i, // 4 * i32: ox[4..8]*K_x, wrapping
+        oz_lo_z_term: __m256i, // 4 * i64: oz[0..4]*K_z
+        oz_hi_z_term: __m256i, // 4 * i64: oz[4..8]*K_z
+        dlo:    i64,
+        dhi:    i64,
+        blocks: &super::Blocks,
+    ) -> u8 {
+        // SAFETY: caller guarantees AVX2 is available.
+        unsafe {
             let mut active_lo: u8 = 0x0F;
             let mut active_hi: u8 = 0x0F;
 
-            // Hoist ox * K_x out of the block loop.
-            //
-            // Wrapping i32 multiplication distributes over addition in Z/2³²Z:
-            //   (ox + bx) * K ≡ ox*K + bx*K  (mod 2³²)
-            // so the per-position ox*K multiply is computed once here; inside the
-            // loop only a cheap _mm_add_epi32 with the precomputed bx*K
-            // (Blocks::bx_hash_term) is needed.  The i32 sum is sign-extended to
-            // i64 inside math_hash_x4_precomputed, matching Java's `(long)(x * 3129871)`.
-            let k_x = _mm_set1_epi32(3_129_871_i32);
-            let ox_lo_term = _mm_mullo_epi32(ox_lo, k_x); // 4 * i32, wrapping
-            let ox_hi_term = _mm_mullo_epi32(ox_hi, k_x); // 4 * i32, wrapping
-
-            // Hoist oz * K_z out of the block loop (Flaw 1 fix).
-            //
-            // Mirrors the AVX-512 path: sign-extend the i32 oz values to i64 and
-            // multiply by K_z = 116_129_781 once before the loop.  Inside the loop
-            // only a cheap _mm256_add_epi64 with the precomputed bz_hash_term is
-            // needed.  Both oz and K_z fit in i32, so the full i64 product is exact.
-            let k_z = _mm256_set1_epi64x(116_129_781_i64);
-            let oz_lo_i64    = _mm256_cvtepi32_epi64(oz_lo);       // 4 * i64
-            let oz_hi_i64    = _mm256_cvtepi32_epi64(oz_hi);       // 4 * i64
-            let oz_lo_z_term = mullo_epi64(oz_lo_i64, k_z);        // hoisted oz*K_z (lo half)
-            let oz_hi_z_term = mullo_epi64(oz_hi_i64, k_z);        // hoisted oz*K_z (hi half)
-
-            // Single block loop — N iterations instead of 2N.
-            // Both halves are updated together; each SoA field (bx_hash_term,
-            // bz_hash_term, y, prob_threshold, sbb_xor) is fetched once per block.
-            //
-            // Optimisation 11: extract all five SoA slices before the loop so LLVM
-            // can prove they are all of equal length `n` and hoist the five
-            // independent bounds checks out of the loop entirely (mirrors the
-            // "Flaw 5 fix" already applied to the scalar `check_formation`).
             let bx_s  = &blocks.bx_hash_term[..];
             let bz_s  = &blocks.bz_hash_term[..];
             let y_s   = &blocks.y[..];
             let thr_s = &blocks.prob_threshold[..];
             let sbb_s = &blocks.sbb_xor[..];
             let n     = bx_s.len();
-            assert_eq!(n, bz_s.len(),  "Blocks field length mismatch: bz_hash_term");
-            assert_eq!(n, y_s.len(),   "Blocks field length mismatch: y");
-            assert_eq!(n, thr_s.len(), "Blocks field length mismatch: prob_threshold");
-            assert_eq!(n, sbb_s.len(), "Blocks field length mismatch: sbb_xor");
+            debug_assert_eq!(n, bz_s.len(),  "Blocks field length mismatch: bz_hash_term");
+            debug_assert_eq!(n, y_s.len(),   "Blocks field length mismatch: y");
+            debug_assert_eq!(n, thr_s.len(), "Blocks field length mismatch: prob_threshold");
+            debug_assert_eq!(n, sbb_s.len(), "Blocks field length mismatch: sbb_xor");
 
             for i in 0..n {
-                // x_term: ox*K (hoisted) + bx*K (per block), all in i32 wrapping space.
-                // sign-extension to i64 happens inside math_hash_x4_precomputed.
-                let bx_k = _mm_set1_epi32(bx_s[i]);
-                let x_lo = _mm_add_epi32(ox_lo_term, bx_k);
-                let x_hi = _mm_add_epi32(ox_hi_term, bx_k);
+                let bx_k  = _mm_set1_epi32(bx_s[i]);
+                let x_lo  = _mm_add_epi32(ox_lo_term, bx_k);
+                let x_hi  = _mm_add_epi32(ox_hi_term, bx_k);
 
-                // term_z: hoisted oz*K_z + precomputed bz*K_z (from bz_hash_term).
-                // Replaces the per-block cvtepi32_epi64 + mul_epi32 pair that
-                // previously executed on every block iteration.
-                let bz_term    = _mm256_set1_epi64x(bz_s[i]);
-                let term_z_lo  = _mm256_add_epi64(oz_lo_z_term, bz_term);
-                let term_z_hi  = _mm256_add_epi64(oz_hi_z_term, bz_term);
+                let bz_term   = _mm256_set1_epi64x(bz_s[i]);
+                let term_z_lo = _mm256_add_epi64(oz_lo_z_term, bz_term);
+                let term_z_hi = _mm256_add_epi64(oz_hi_z_term, bz_term);
 
-                // Fetch the per-block scalars once; share across both SIMD calls.
                 let y   = y_s[i];
                 let thr = thr_s[i];
-                let sbb = sbb_s[i]; // 0x00 = bedrock expected, 0xFF = non-bedrock
+                let sbb = sbb_s[i];
 
                 active_lo &= is_bedrock_x4_precomputed(dlo, dhi, x_lo, y, term_z_lo, thr, sbb);
                 active_hi &= is_bedrock_x4_precomputed(dlo, dhi, x_hi, y, term_z_hi, thr, sbb);
 
-                // Early exit: both halves have eliminated all their lanes.
                 if (active_lo | active_hi) == 0 { return 0; }
             }
 
-            // Pack nibbles: lo in bits 0-3, hi shifted to bits 4-7.
             active_lo | (active_hi << 4)
         }
     }
+
 }
 
 // SIMD kernel (AVX-512, x86-64 only) 
@@ -905,80 +1017,72 @@ mod simd_avx512 {
         }
     }
 
-    /// Returns an 8-bit mask of the positions (within a group of 8) that match
-    /// the entire formation.  Exits early as soon as no lanes remain active.
+    /// Precompute the position-dependent hash terms for 8 spiral positions.
+    ///
+    /// Returns `(ox_term_i32: __m256i, oz_term_v: __m512i)` — the hoisted x and z
+    /// multiplications that depend only on `(xs, zs)`, not on any block list.
+    /// When multiple rotations are checked for the same group of 8 positions,
+    /// calling this once and forwarding the results to `check_formation_x8_with_terms`
+    /// avoids recomputing the same two multiplications for every rotation.
     ///
     /// # Safety
-    /// Requires AVX-512F + AVX-512DQ.  Caller must have verified feature support.
+    /// Requires AVX-512F, AVX-512DQ, and AVX2.
+    #[target_feature(enable = "avx512f,avx512dq,avx2")]
+    #[inline]
+    pub unsafe fn position_terms_x8(
+        positions_x: &[i32; 8],
+        positions_z: &[i32; 8],
+    ) -> (__m256i, __m512i) {
+        // SAFETY: caller guarantees AVX-512F, AVX-512DQ, and AVX2 are available.
+        unsafe {
+            let ox_v = _mm256_loadu_si256(positions_x.as_ptr() as *const __m256i);
+            let oz_v = _mm256_loadu_si256(positions_z.as_ptr() as *const __m256i);
+            let oz64      = _mm512_cvtepi32_epi64(oz_v);
+            let oz_term_v = _mm512_mullo_epi64(oz64, _mm512_set1_epi64(116_129_781_i64));
+            let ox_term_i32 = _mm256_mullo_epi32(ox_v, _mm256_set1_epi32(3_129_871_i32));
+            (ox_term_i32, oz_term_v)
+        }
+    }
+
+    /// Inner formation check that accepts pre-computed position terms (optimisation 2).
+    ///
+    /// Accepts `ox_term_i32` and `oz_term_v` already produced by `position_terms_x8`,
+    /// eliminating the two SIMD multiplications that would otherwise be re-executed
+    /// for every rotation when `search_all_rotations` is active.
+    ///
+    /// # Safety
+    /// Requires AVX-512F + AVX-512DQ + AVX2.
     #[inline]
     #[target_feature(enable = "avx512f,avx512dq,avx2")]
-    pub unsafe fn check_formation_x8(
-        positions_x: &[i32], // exactly 8 entries (contiguous i32 array)
-        positions_z: &[i32], // exactly 8 entries (contiguous i32 array)
+    pub unsafe fn check_formation_x8_with_terms(
+        ox_term_i32: __m256i, // 8 * i32: ox*K_x in wrapping i32 space, pre-computed
+        oz_term_v:   __m512i, // 8 * i64: oz*K_z, pre-computed
         dlo:    i64,
         dhi:    i64,
         blocks: &super::Blocks,
     ) -> u8 {
-        debug_assert_eq!(positions_x.len(), 8);
-        debug_assert_eq!(positions_z.len(), 8);
-
-        // SAFETY: caller guarantees AVX-512F, AVX-512DQ, and AVX2 are available
-        // (enforced by #[target_feature]).
+        // SAFETY: caller guarantees AVX-512F, AVX-512DQ, and AVX2 are available.
         unsafe {
-            // Single 256-bit load replaces 8 scalar moves from _mm256_set_epi32.
-            // Both slices are contiguous i32 arrays, so loadu_si256 is valid and
-            // places element [0] in lane 0, which is the same lane ordering as before.
-            let ox_v = _mm256_loadu_si256(positions_x.as_ptr() as *const __m256i);
-            let oz_v = _mm256_loadu_si256(positions_z.as_ptr() as *const __m256i);
-
-            // Hoist the z position-dependent hash multiplication out of the block
-            // loop.  For z the Java idiom is `(long)z * 116_129_781L` — a true i64
-            // multiply — so distributivity holds exactly in 64-bit space:
-            //   term_z = (oz + bz) * K_z  ==  oz*K_z + bz*K_z
-            // and we can safely add the precomputed per-block bz_hash_term inside.
-            //
-            // For x the Java idiom is `(long)(x * 3129871)` — multiply first in
-            // i32 (wrapping), then sign-extend.  Wrapping i32 multiplication also
-            // distributes over addition in Z/2³²Z:
-            //   (ox + bx) * K ≡ ox*K + bx*K  (mod 2³²)
-            // so we hoist ox*K_x out of the block loop in i32 space and add the
-            // precomputed bx*K (Blocks::bx_hash_term) inside.  The i32 sum is
-            // sign-extended to i64 afterwards, matching the scalar path exactly.
-            let oz64 = _mm512_cvtepi32_epi64(oz_v);
-            let oz_term_v = _mm512_mullo_epi64(oz64, _mm512_set1_epi64(116_129_781_i64)); // z stays 64-bit ✓
-
-            // ox * K_x hoisted: one mullo_epi32 for all blocks.
-            let ox_term_i32 = _mm256_mullo_epi32(ox_v, _mm256_set1_epi32(3_129_871_i32)); // 8 * i32, wrapping ✓
-
             let mut active: u8 = 0xFF; // bits 0-7 all set = all lanes in play
 
             // Optimisation 11: extract all five SoA slices before the loop so LLVM
             // can prove they are all of equal length `n` and hoist the five
-            // independent bounds checks out of the loop entirely (mirrors the
-            // "Flaw 5 fix" already applied to the scalar `check_formation`).
-            // SoA hot loop: prob_threshold, sbb_xor, y, bx_hash_term,
-            // and bz_hash_term each live in separate contiguous streams.
+            // independent bounds checks out of the loop entirely.
             let bx_s  = &blocks.bx_hash_term[..];
             let bz_s  = &blocks.bz_hash_term[..];
             let y_s   = &blocks.y[..];
             let thr_s = &blocks.prob_threshold[..];
             let sbb_s = &blocks.sbb_xor[..];
             let n     = bx_s.len();
-            assert_eq!(n, bz_s.len(),  "Blocks field length mismatch: bz_hash_term");
-            assert_eq!(n, y_s.len(),   "Blocks field length mismatch: y");
-            assert_eq!(n, thr_s.len(), "Blocks field length mismatch: prob_threshold");
-            assert_eq!(n, sbb_s.len(), "Blocks field length mismatch: sbb_xor");
+            debug_assert_eq!(n, bz_s.len(),  "Blocks field length mismatch: bz_hash_term");
+            debug_assert_eq!(n, y_s.len(),   "Blocks field length mismatch: y");
+            debug_assert_eq!(n, thr_s.len(), "Blocks field length mismatch: prob_threshold");
+            debug_assert_eq!(n, sbb_s.len(), "Blocks field length mismatch: sbb_xor");
 
             for i in 0..n {
-                // term_x: ox*K (hoisted, i32) + bx*K (per block, i32), then sign-extend.
-                // All arithmetic stays in i32 wrapping space until cvtepi32_epi64,
-                // matching Java's `(long)(x * 3129871)` semantics exactly.
-                let abs_x_i32 = _mm256_add_epi32(ox_term_i32, _mm256_set1_epi32(bx_s[i])); // i32 add ✓
-                let term_x    = _mm512_cvtepi32_epi64(abs_x_i32);                           // sign-extend ✓
-
-                // term_z: z stays 64-bit throughout, so the hoisted oz_term_v +
-                // per-block bz_hash_term addition is correct.
-                let term_z = _mm512_add_epi64(oz_term_v, _mm512_set1_epi64(bz_s[i]));
+                let abs_x_i32 = _mm256_add_epi32(ox_term_i32, _mm256_set1_epi32(bx_s[i]));
+                let term_x    = _mm512_cvtepi32_epi64(abs_x_i32);
+                let term_z    = _mm512_add_epi64(oz_term_v, _mm512_set1_epi64(bz_s[i]));
 
                 let passed = is_bedrock_x8(dlo, dhi, term_x, y_s[i], term_z, thr_s[i], sbb_s[i]);
                 active &= passed;
@@ -987,6 +1091,7 @@ mod simd_avx512 {
             active
         }
     }
+
 }
 
 // SIMD dispatch level 
@@ -1197,12 +1302,20 @@ fn fill_group_from_state(
 //
 // `uniform_fill(x, z, dx, dz, xs, zs)` is called on the fast uniform-leg path.
 // `check_group(xs, zs)` returns true if any position in the group matches.
+//
+// `cancel` is checked at the start of every chunk closure.  Returning `false`
+// (not a match) drains remaining workers immediately; `find_first` returns
+// `None`, and the outer loop catches the flag on its next iteration.  This
+// bounds cancel latency to one chunk duration (a few µs) regardless of how
+// large `total_chunks` is.
 
 #[inline(always)]
 fn run_chunk_batch<Fill, Check>(
-    batch_base: i64,
+    batch_base:   i64,
+    total_chunks: i64,   // chunks to dispatch in this single find_first call
     start_x:    i32,
     start_z:    i32,
+    cancel:     &AtomicBool,
     uniform_fill: &Fill,
     check_group:  &Check,
 ) -> Option<i64>
@@ -1210,7 +1323,13 @@ where
     Fill:  Fn(i32, i32, i32, i32, &mut [i32; 8], &mut [i32; 8]) + Sync,
     Check: Fn(&[i32; 8], &[i32; 8]) -> bool + Sync,
 {
-    (0..CHUNKS_PER_BATCH).into_par_iter().find_first(|&ci| {
+    (0..total_chunks).into_par_iter().find_first(|&ci| {
+        // Fast-path exit: if the user cancelled (or another super-batch found a
+        // result and set the flag), skip all work in this chunk and return false.
+        // All workers drain within one chunk (~8 192 positions, a few µs), so
+        // find_first returns None and the outer loop hits the cancel check.
+        if cancel.load(Ordering::Relaxed) { return false; }
+
         let chunk_base_group = batch_base + ci * GROUPS_PER_CHUNK;
         let base_k = chunk_base_group * 8;
 
@@ -1273,17 +1392,24 @@ fn main() -> iced::Result {
 ///   3× CW  ->  ( z, −x)
 fn rotate_blocks(blocks: &[Block], times_cw: u8) -> Vec<Block> {
     if blocks.is_empty() { return vec![]; }
-    let transformed: Vec<(i32, i32)> = blocks.iter().map(|b| {
-        match times_cw % 4 {
+    // Single pass: transform each block and track the running min of tx/tz
+    // simultaneously, avoiding the intermediate `transformed` Vec and the
+    // two extra full-slice iterations over it.
+    let mut transformed: Vec<(i32, i32)> = Vec::with_capacity(blocks.len());
+    let mut min_x = i32::MAX;
+    let mut min_z = i32::MAX;
+    for b in blocks {
+        let (tx, tz) = match times_cw % 4 {
             0 => ( b.x,  b.z),
             1 => (-b.z,  b.x),
             2 => (-b.x, -b.z),
             3 => ( b.z, -b.x),
             _ => unreachable!(),
-        }
-    }).collect();
-    let min_x = transformed.iter().map(|&(x, _)| x).min().unwrap();
-    let min_z = transformed.iter().map(|&(_, z)| z).min().unwrap();
+        };
+        if tx < min_x { min_x = tx; }
+        if tz < min_z { min_z = tz; }
+        transformed.push((tx, tz));
+    }
     blocks.iter().zip(transformed.iter()).map(|(b, &(tx, tz))| Block {
         x: tx - min_x,
         z: tz - min_z,
@@ -1295,8 +1421,11 @@ fn rotate_blocks(blocks: &[Block], times_cw: u8) -> Vec<Block> {
 }
 
 /// Canonical signature for deduplication: sorted list of (x, y, z, is_bedrock).
-fn blocks_signature(blocks: &[Block]) -> Vec<(i32, i32, i32, bool)> {
-    let mut sig: Vec<_> = blocks
+/// Patterns have at most a few dozen blocks (≤ ~50 in practice), so an
+/// inline-capacity-64 SmallVec keeps this entirely on the stack and avoids
+/// a heap allocation per rotation during startup deduplication.
+fn blocks_signature(blocks: &[Block]) -> SmallVec<[(i32, i32, i32, bool); 64]> {
+    let mut sig: SmallVec<[(i32, i32, i32, bool); 64]> = blocks
         .iter()
         .map(|b| (b.x, b.y, b.z, b.should_be_bedrock))
         .collect();
@@ -1307,7 +1436,7 @@ fn blocks_signature(blocks: &[Block]) -> Vec<(i32, i32, i32, bool)> {
 /// Return up to 4 distinct rotations of `blocks` (fewer if the pattern has
 /// rotational symmetry, e.g. a symmetric 2-rotation pattern yields only 2).
 fn generate_rotations(blocks: Vec<Block>) -> Vec<Vec<Block>> {
-    let mut seen: std::collections::HashSet<Vec<(i32, i32, i32, bool)>> =
+    let mut seen: std::collections::HashSet<SmallVec<[(i32, i32, i32, bool); 64]>> =
         std::collections::HashSet::with_capacity(4);
     let mut rotations: Vec<Vec<Block>> = Vec::with_capacity(4);
     for r in 0..4u8 {
@@ -1376,15 +1505,16 @@ fn rotate_grid_ccw(
 
 // GUI - search runner
 
-/// Convert a spiral position index to a human-readable "NxN area" label.
+/// Format an area label for a precomputed spiral shell number `l`
+/// (the spiral's bounding square at shell `l` has side `2l+1`).
 ///
-/// The spiral fills a square that grows as the shell number L increases.
-/// At spiral index k the shell is approximately L = sqrt(k)/2, so the
-/// bounding square has side ≈ 2L+1.  We round to a friendly unit.
-fn area_label(spiral_index: i64) -> String {
-    if spiral_index <= 0 { return "0 × 0".into(); }
-    // Shell L: 4L²−4L+1 ≤ k < 4L²+4L+1; side length = 2L+1
-    let l = ((1.0 + (spiral_index as f64).sqrt()) * 0.5) as i64;
+/// The shell `l` for spiral index `k` is `floor((1 + sqrt(k)) / 2)`, but
+/// computing it via `sqrt` on every progress callback is wasteful since
+/// `k` (== `batch_start_group * 8`) only grows monotonically by
+/// `GROUPS_PER_BATCH * 8` each step. `Message::SearchProgress` instead
+/// tracks `l` incrementally with integer arithmetic and calls this function
+/// purely to format the result.
+fn area_label_from_l(l: i64) -> String {
     let side = (2 * l + 1) as u64; // positions per axis
     // Express as rounded friendly number
     let fmt_n = |n: u64| -> String {
@@ -1404,50 +1534,63 @@ fn run_search(
     start_x: i32,
     start_z: i32,
     bt: BedrockType,
-    mut blocks: Vec<Block>,
+    // One block-set per rotation to test (1 entry for a single-orientation
+    // search, up to 4 when `search_all_rotations` is enabled). The spiral is
+    // traversed exactly once; every position is checked against *all*
+    // rotations before moving on, so the cost of the merged search is
+    // independent of how many rotations are supplied (aside from the
+    // per-block formation checks themselves).
+    rotations: Vec<Vec<Block>>,
     cancel: Arc<AtomicBool>,
-    // Set by the parallel-rotation dispatcher when *another* rotation has
-    // already found a match; causes this rotation to bail out early with
-    // `Ok(None)` (same as a user cancellation, but without touching `cancel`).
-    stop_early: Arc<AtomicBool>,
     // Called after each batch with the spiral index at the end of that batch.
     // Pass `None` if progress reporting is not needed.
     progress_cb: Option<&dyn Fn(i64)>,
 ) -> Result<Option<(i32, i32)>, String> {
-    if blocks.is_empty() { return Ok(Some((start_x, start_z))); }
+    if rotations.is_empty() { return Ok(Some((start_x, start_z))); }
 
-    for b in &blocks {
-        if b.probability >= 1.0 && !b.should_be_bedrock {
-            return Err(format!(
-                "Block ({},{},{}) is always bedrock but declared as air. No solution exists.",
-                b.x, b.y, b.z));
+    // Validate, sort, and filter each rotation's block list independently —
+    // a rotation rearranges block *positions* but the per-block validity
+    // rules (and the probability-based ordering that maximises early-exit
+    // effectiveness) apply the same way to each one.
+    let mut blocks_per_rotation: Vec<Vec<Block>> = Vec::with_capacity(rotations.len());
+    for mut blocks in rotations {
+        for b in &blocks {
+            if b.probability >= 1.0 && !b.should_be_bedrock {
+                return Err(format!(
+                    "Block ({},{},{}) is always bedrock but declared as air. No solution exists.",
+                    b.x, b.y, b.z));
+            }
+            if b.probability <= 0.0 && b.should_be_bedrock {
+                return Err(format!(
+                    "Block ({},{},{}) is never bedrock but declared as bedrock. No solution exists.",
+                    b.x, b.y, b.z));
+            }
         }
-        if b.probability <= 0.0 && b.should_be_bedrock {
-            return Err(format!(
-                "Block ({},{},{}) is never bedrock but declared as bedrock. No solution exists.",
-                b.x, b.y, b.z));
-        }
+
+        blocks.sort_by_cached_key(|b| {
+            let key = if b.should_be_bedrock { 1.0 - clamp01(b.probability) } else { clamp01(b.probability) };
+            std::cmp::Reverse(key.to_bits())
+        });
+
+        let blocks: Vec<Block> = blocks.into_iter().filter(|b| {
+            let p = clamp01(b.probability);
+            if b.should_be_bedrock { p < 1.0 } else { p > 0.0 }
+        }).collect();
+
+        // If any single rotation has no remaining constraints, every position
+        // (including the start) trivially satisfies it.
+        if blocks.is_empty() { return Ok(Some((start_x, start_z))); }
+
+        blocks_per_rotation.push(blocks);
     }
-
-    blocks.sort_by_cached_key(|b| {
-        let key = if b.should_be_bedrock { 1.0 - clamp01(b.probability) } else { clamp01(b.probability) };
-        std::cmp::Reverse(key.to_bits())
-    });
-
-    let blocks: Vec<Block> = blocks.into_iter().filter(|b| {
-        let p = clamp01(b.probability);
-        if b.should_be_bedrock { p < 1.0 } else { p > 0.0 }
-    }).collect();
-
-    if blocks.is_empty() { return Ok(Some((start_x, start_z))); }
 
     let (dlo, dhi) = compute_deriver_seeds(seed, bt);
     let simd       = detect_simd();
 
-    // Convert AoS to SoA here, once, before the hot search loop.
+    // Convert AoS to SoA here, once per rotation, before the hot search loop.
     // From this point on the SIMD kernels only touch separate contiguous
     // arrays; the `probability: f64` field never appears in the hot path.
-    let blocks = Blocks::from_vec(blocks);
+    let blocks_list: Vec<Blocks> = blocks_per_rotation.into_iter().map(Blocks::from_vec).collect();
 
     // Parallel search over the spiral using rayon's find_first.
     //
@@ -1459,14 +1602,20 @@ fn run_search(
     // when multiple threads discover candidates simultaneously, and cancels
     // remaining workers once the winner is confirmed.
     //
-    // Cancellation is checked between batches of SEARCH_BATCH_SIZE positions
-    // so the UI Cancel button and the inter-rotation stop signal remain
-    // responsive (one batch completes in ≪ 100 ms even on slow machines).
+    // Optimisation 1+4: `super_batch_chunks` chunks are dispatched in a single
+    // find_first call instead of one CHUNKS_PER_BATCH-chunk call per batch.
+    // This reduces Rayon scope setup/teardown overhead by ~16× and ensures
+    // good load balance on high-core-count machines (≥ 4 chunks/thread).
+    // Cancellation is checked at super-batch boundaries (~16 ms at 1 GHz).
+
+    // Compute once — queries the Rayon thread pool (cheap after initialisation).
+    let super_batch_chunks     = compute_super_batch_chunks();
+    let groups_per_super_batch = super_batch_chunks * GROUPS_PER_CHUNK;
 
     let mut batch_start_group: i64 = 0;
 
     loop {
-        if cancel.load(Ordering::Relaxed) || stop_early.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
 
@@ -1477,10 +1626,10 @@ fn run_search(
         // monomorphised for each path so the per-group branches and dead SIMD code
         // are fully eliminated from each machine-code variant.
         //
-        // Each arm captures (dlo, dhi, &blocks) by value/reference in closures whose
-        // types are distinct, so Rust produces three separate monomorphisations of
-        // run_chunk_batch — one per SIMD level — with no indirect calls and full
-        // inlining of check_formation_x8 / check_formation_x8_avx2 / check_formation.
+        // Optimisation 2: position-dependent hash terms (ox*K_x, oz*K_z) are now
+        // computed ONCE per group of 8 positions and forwarded to the per-rotation
+        // inner checks via the *_with_terms variants.  With all 4 rotations active
+        // this eliminates 3/4 of those multiplications from the hot path.
 
         // Scalar uniform-fill closure (used on non-AVX2 path).
         let scalar_fill = |x: i32, z: i32, dx: i32, dz: i32,
@@ -1490,9 +1639,17 @@ fn run_search(
                 zs[i as usize] = z + i * dz;
             }
         };
+        // Optimisation 2 scalar path: compute ox/oz terms once per group, then check
+        // each rotation with check_formation_with_terms (avoids recomputing the two
+        // multiplications 4× when search_all_rotations is active).
         let scalar_check = |xs: &[i32; 8], zs: &[i32; 8]| {
-            xs.iter().zip(zs.iter())
-                .any(|(&cx, &cz)| check_formation(cx, cz, dlo, dhi, &blocks))
+            xs.iter().zip(zs.iter()).any(|(&cx, &cz)| {
+                let ox_i32_term = cx.wrapping_mul(3_129_871_i32);
+                let oz_i64_term = (cz as i64).wrapping_mul(116_129_781_i64);
+                blocks_list.iter().any(|blocks| {
+                    check_formation_with_terms(ox_i32_term, oz_i64_term, dlo, dhi, blocks)
+                })
+            })
         };
 
         // Named wrapper functions so that #[target_feature] can be applied —
@@ -1512,56 +1669,88 @@ fn run_search(
             unsafe { simd_avx2::fill_group_uniform(x, z, dx, dz, xs, zs); }
         }
 
+        // Optimisation 2 wrappers: separate position-term computation from the
+        // per-rotation block loop so terms are not recomputed once per rotation.
+
         #[cfg(target_arch = "x86_64")]
         #[inline]
         #[target_feature(enable = "avx512f,avx512dq,avx2")]
-        unsafe fn avx512_check(
+        unsafe fn avx512_position_terms(
             xs: &[i32; 8], zs: &[i32; 8],
+        ) -> (core::arch::x86_64::__m256i, core::arch::x86_64::__m512i) {
+            unsafe { simd_avx512::position_terms_x8(xs, zs) }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        #[inline]
+        #[target_feature(enable = "avx512f,avx512dq,avx2")]
+        unsafe fn avx512_check_with_terms(
+            ox_term: core::arch::x86_64::__m256i,
+            oz_term: core::arch::x86_64::__m512i,
             dlo: i64, dhi: i64, blocks: &Blocks,
         ) -> bool {
-            // SAFETY: caller guarantees AVX-512F+DQ is available.
-            unsafe { simd_avx512::check_formation_x8(xs, zs, dlo, dhi, blocks) != 0 }
+            unsafe { simd_avx512::check_formation_x8_with_terms(ox_term, oz_term, dlo, dhi, blocks) != 0 }
         }
 
         #[cfg(target_arch = "x86_64")]
         #[inline]
         #[target_feature(enable = "avx2")]
-        unsafe fn avx2_check(
+        unsafe fn avx2_position_terms(
             xs: &[i32; 8], zs: &[i32; 8],
+        ) -> (core::arch::x86_64::__m128i, core::arch::x86_64::__m128i,
+              core::arch::x86_64::__m256i, core::arch::x86_64::__m256i) {
+            unsafe { simd_avx2::position_terms_x8_avx2(xs, zs) }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn avx2_check_with_terms(
+            oxlo: core::arch::x86_64::__m128i,
+            oxhi: core::arch::x86_64::__m128i,
+            ozlo: core::arch::x86_64::__m256i,
+            ozhi: core::arch::x86_64::__m256i,
             dlo: i64, dhi: i64, blocks: &Blocks,
         ) -> bool {
-            // SAFETY: caller guarantees AVX2 is available.
-            unsafe { simd_avx2::check_formation_x8_avx2(xs, zs, dlo, dhi, blocks) != 0 }
+            unsafe { simd_avx2::check_formation_x8_avx2_with_terms(oxlo, oxhi, ozlo, ozhi, dlo, dhi, blocks) != 0 }
         }
 
         let found_chunk: Option<i64> = match simd {
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx512 => run_chunk_batch(
-                batch_base, start_x, start_z,
+                batch_base, super_batch_chunks, start_x, start_z, &cancel,
                 &|x: i32, z: i32, dx: i32, dz: i32,
                   xs: &mut [i32; 8], zs: &mut [i32; 8]| {
                     // SAFETY: AVX2 was verified by detect_simd (AVX-512 ⟹ AVX2).
                     unsafe { avx2_fill(x, z, dx, dz, xs, zs); }
                 },
                 &|xs: &[i32; 8], zs: &[i32; 8]| {
+                    // Compute position terms once, then check each rotation.
                     // SAFETY: AVX-512F+DQ verified by detect_simd.
-                    unsafe { avx512_check(xs, zs, dlo, dhi, &blocks) }
+                    let (ox_term, oz_term) = unsafe { avx512_position_terms(xs, zs) };
+                    blocks_list.iter().any(|blocks| unsafe {
+                        avx512_check_with_terms(ox_term, oz_term, dlo, dhi, blocks)
+                    })
                 },
             ),
             #[cfg(target_arch = "x86_64")]
             SimdLevel::Avx2 => run_chunk_batch(
-                batch_base, start_x, start_z,
+                batch_base, super_batch_chunks, start_x, start_z, &cancel,
                 &|x: i32, z: i32, dx: i32, dz: i32,
                   xs: &mut [i32; 8], zs: &mut [i32; 8]| {
                     // SAFETY: AVX2 verified by detect_simd.
                     unsafe { avx2_fill(x, z, dx, dz, xs, zs); }
                 },
                 &|xs: &[i32; 8], zs: &[i32; 8]| {
+                    // Compute position terms once, then check each rotation.
                     // SAFETY: AVX2 verified by detect_simd.
-                    unsafe { avx2_check(xs, zs, dlo, dhi, &blocks) }
+                    let (oxlo, oxhi, ozlo, ozhi) = unsafe { avx2_position_terms(xs, zs) };
+                    blocks_list.iter().any(|blocks| unsafe {
+                        avx2_check_with_terms(oxlo, oxhi, ozlo, ozhi, dlo, dhi, blocks)
+                    })
                 },
             ),
-            _ => run_chunk_batch(batch_base, start_x, start_z, &scalar_fill, &scalar_check),
+            _ => run_chunk_batch(batch_base, super_batch_chunks, start_x, start_z, &cancel, &scalar_fill, &scalar_check),
         };
 
         if let Some(ci) = found_chunk {
@@ -1582,12 +1771,12 @@ fn run_search(
                     start_x, start_z,
                 );
                 let hit = xs.iter().zip(zs.iter())
-                    .any(|(&cx, &cz)| check_formation(cx, cz, dlo, dhi, &blocks));
+                    .any(|(&cx, &cz)| blocks_list.iter().any(|blocks| check_formation(cx, cz, dlo, dhi, blocks)));
                 if hit {
                     // xs and zs are already populated by fill_group_from_state above —
                     // no need to recompute positions via spiral_coords (which calls sqrt).
                     for p in 0..8usize {
-                        if check_formation(xs[p], zs[p], dlo, dhi, &blocks) {
+                        if blocks_list.iter().any(|blocks| check_formation(xs[p], zs[p], dlo, dhi, blocks)) {
                             return Ok(Some((xs[p], zs[p])));
                         }
                     }
@@ -1609,7 +1798,7 @@ fn run_search(
             );
         }
 
-        batch_start_group += GROUPS_PER_BATCH;
+        batch_start_group += groups_per_super_batch;
 
         // Report progress: the spiral index at the end of this batch.
         if let Some(cb) = progress_cb {
@@ -1699,6 +1888,13 @@ struct App {
     progress_pos:  Option<Arc<AtomicI64>>,
     /// UI zoom level: 1.0 = default, range 0.5-2.0 in steps of 0.1.
     ui_scale:      f32,
+    /// Cached spiral shell number `L` for the current search's progress
+    /// label, updated incrementally in `Message::SearchProgress` so the
+    /// per-callback handler doesn't need to call `sqrt` every time.
+    area_label_l:           i64,
+    /// Spiral index at which `area_label_l` next needs to increment
+    /// (= 4L²+4L+1 for the current `area_label_l`).
+    area_label_next_thresh: i64,
 }
 
 impl Default for App {
@@ -1724,6 +1920,8 @@ impl Default for App {
             search_start:  None,
             progress_pos:  None,
             ui_scale:      1.0,
+            area_label_l:           0,
+            area_label_next_thresh: 1,
         }
     }
 }
@@ -1932,106 +2130,30 @@ impl Application for App {
                 let progress_pos = Arc::new(AtomicI64::new(0));
                 self.progress_pos = Some(progress_pos.clone());
                 self.status = SearchStatus::Searching("0 × 0".into());
+                self.area_label_l = 0;
+                self.area_label_next_thresh = 1;
                 Command::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
                             // Build the list of block-sets to search: either just
-                            // the entered pattern, or all 4 rotations of it.
+                            // the entered pattern, or all 4 rotations of it. The
+                            // spiral is traversed exactly once regardless of how
+                            // many rotations are present — each candidate position
+                            // is checked against every rotation's block-set before
+                            // moving on, so a match against *any* rotation ends
+                            // the search immediately.
                             let rotations: Vec<Vec<Block>> = if all_rotations {
                                 generate_rotations(blocks_vec)
                             } else {
                                 vec![blocks_vec]
                             };
 
-                            if rotations.len() == 1 {
-                                // Single rotation: no parallelism overhead; dummy
-                                // stop_early that is never set.
-                                let pp = progress_pos.clone();
-                                run_search(
-                                    seed, start_x, start_z, bt,
-                                    rotations.into_iter().next().unwrap(),
-                                    cancel,
-                                    Arc::new(AtomicBool::new(false)),
-                                    Some(&|idx| { pp.store(idx, Ordering::Relaxed); }),
-                                )
-                            } else {
-                                // Multi-rotation parallel search
-                                //
-                                // Each rotation runs as an independent rayon task.
-                                // Rayon's work-stealing scheduler distributes
-                                // available cores across rotations automatically,
-                                // giving ~N/R threads to each (N cores, R rotations)
-                                // without the overhead of building separate pools.
-                                //
-                                // `stop_rotations` is a shared flag: the first
-                                // rotation to find a match sets it, causing every
-                                // other rotation to bail out at the next batch
-                                // boundary (≤ SEARCH_BATCH_SIZE iterations later).
-                                // The user-cancel flag (`cancel`) is still
-                                // propagated independently so the UI Cancel button
-                                // continues to work normally.
-                                let stop_rotations = Arc::new(AtomicBool::new(false));
-
-                                let results: Vec<Result<Option<(i32, i32)>, String>> =
-                                    rotations
-                                        .into_par_iter()
-                                        .map(|rot| {
-                                            // Fast-path: skip if already done.
-                                            if cancel.load(Ordering::Relaxed)
-                                                || stop_rotations.load(Ordering::Relaxed)
-                                            {
-                                                return Ok(None);
-                                            }
-                                            let pp = progress_pos.clone();
-                                            let result = run_search(
-                                                seed, start_x, start_z, bt,
-                                                rot,
-                                                cancel.clone(),
-                                                stop_rotations.clone(),
-                                                Some(&|idx| {
-                                                    // Take the max so that the displayed area
-                                                    // only ever grows (multiple rotations may
-                                                    // report different indices).
-                                                    let prev = pp.load(Ordering::Relaxed);
-                                                    if idx > prev {
-                                                        pp.store(idx, Ordering::Relaxed);
-                                                    }
-                                                }),
-                                            );
-                                            // Signal remaining rotations to stop as
-                                            // soon as this one finds a match.
-                                            if matches!(result, Ok(Some(_))) {
-                                                stop_rotations.store(true, Ordering::Relaxed);
-                                            }
-                                            result
-                                        })
-                                        .collect();
-
-                                // Pick the best outcome in priority order:
-                                //   1. Any successful match  (Ok(Some(_)))
-                                //   2. User/early cancellation (Ok(None))
-                                //   3. Last impossible-pattern error (Err(_))
-                                let mut last: Result<Option<(i32, i32)>, String> = Ok(None);
-                                let mut saw_cancellation = false;
-                                for r in results {
-                                    match r {
-                                        Ok(Some(_)) => return r,           // found; done
-                                        Ok(None)    => { saw_cancellation = true; last = Ok(None); } // cancelled
-                                        Err(e)      => {
-                                            // Only downgrade to an error if we
-                                            // have no cancellation to report yet.
-                                            // Note: `last` is initialised to Ok(None) but
-                                            // that sentinel must not be confused with a
-                                            // real cancellation, so we track the latter
-                                            // separately with `saw_cancellation`.
-                                            if !saw_cancellation {
-                                                last = Err(e);
-                                            }
-                                        }
-                                    }
-                                }
-                                last
-                            }
+                            run_search(
+                                seed, start_x, start_z, bt,
+                                rotations,
+                                cancel,
+                                Some(&|idx| { progress_pos.store(idx, Ordering::Relaxed); }),
+                            )
                         })
                             .await
                             .unwrap_or_else(|e| Err(format!("Thread panic: {e}")))
@@ -2052,7 +2174,20 @@ impl Application for App {
 
             Message::SearchProgress(idx) => {
                 if matches!(self.status, SearchStatus::Searching(_)) {
-                    self.status = SearchStatus::Searching(area_label(idx));
+                    if idx <= 0 {
+                        self.status = SearchStatus::Searching("0 × 0".into());
+                    } else {
+                        // batch_start_group (and thus idx) grows monotonically,
+                        // so the shell L only ever increases. Step it forward
+                        // algebraically (no sqrt) until idx is back within the
+                        // current shell's range.
+                        while idx >= self.area_label_next_thresh {
+                            self.area_label_l += 1;
+                            let l = self.area_label_l;
+                            self.area_label_next_thresh = 4 * l * l + 4 * l + 1;
+                        }
+                        self.status = SearchStatus::Searching(area_label_from_l(self.area_label_l));
+                    }
                 }
                 Command::none()
             }

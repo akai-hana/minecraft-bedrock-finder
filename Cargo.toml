@@ -15,10 +15,11 @@ md5   = "0.7"
 rayon = "1"
 iced  = { version = "0.12", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+smallvec = "1.15.1"
 
 [profile.release]
 opt-level     = 3
-lto           = true
+lto           = "fat" 
 codegen-units = 1
 panic         = "abort"
 strip         = "symbols" # "debuginfo" keeps symbol names; "symbols" strips them too
