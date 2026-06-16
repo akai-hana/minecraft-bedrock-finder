@@ -1,184 +1,96 @@
-# bedrockformation
+<div align="center">
 
-A high-performance Rust port of [Developer-Mike's Minecraft Bedrock Formation Finder](https://github.com/Developer-Mike/Minecraft-Bedrock-Formation-Finder-1.18) for Minecraft Java Edition 1.18+.
+# Minecraft bedrock finder
 
-Given a world seed and a set of observed bedrock blocks, this tool searches the world in a spiral outward from a given coordinate until it finds where that exact formation exists, letting you determine your coordinates in a seed purely from the shape of the bedrock layer.
+###### Find any bedrock pattern blazingly fast.
 
----
+<img width="500" alt="image" src="https://github.com/user-attachments/assets/e7adb365-d5f3-44b5-b516-2eaff2739b69"/>
 
-## Table of contents
+</div>
 
-- [How it works](#how-it-works)
-- [Differences from the Java original](#differences-from-the-java-original)
-  - [Bug fixes](#bug-fixes)
-  - [Performance improvements](#performance-improvements)
-- [Building](#building)
-- [Usage](#usage)
-  - [Arguments](#arguments)
-  - [Examples](#examples)
-  - [Reading the bedrock layer](#reading-the-bedrock-layer)
-- [Benchmarks](#benchmarks)
-- [Credits](#credits)
+<br>
+
+This tool searches a world's seed spiraling outwards from a given coordinate _(0,0 by default)_, until it finds the pattern specified.
 
 ---
 
-## How it works
-
-In Minecraft 1.18+, bedrock generation is deterministic: each block position is either bedrock or air based on the world seed, the block's XYZ coordinates, and which layer it sits in (floor or roof). The probability of a block being bedrock decreases linearly as you move away from the solid edge:
-
-**Floor** (Y = −64 to −59)
-
-| Y | Probability of bedrock |
-|---|---|
-| −64 | 100% (always bedrock) |
-| −63 | 80% |
-| −62 | 60% |
-| −61 | 40% |
-| −60 | 20% |
-| −59 | 0% (never bedrock) |
-
-**Roof** (Y = 122 to 127)
-
-| Y | Probability of bedrock |
-|---|---|
-| 127 | 100% (always bedrock) |
-| 126 | 80% |
-| 125 | 60% |
-| 124 | 40% |
-| 123 | 20% |
-| 122 | 0% (never bedrock) |
-
-The tool encodes a formation as a list of offsets relative to an unknown origin (blocks that should be bedrock, and blocks that should be air), then walks a spiral of candidate origin coordinates, testing each one against the world seed until it finds a match.
-
-The search uses the same RNG chain as Minecraft itself: the world seed is fed through SplitMix64 and Xoroshiro128++ to derive a per-layer deriver seed, which is then hashed per-block using `MathHelper.hashCode` to produce a single float that is compared against the block's probability threshold.
+> TODO: table of contents
 
 ---
 
-## Differences from the Java original
+## Installation
 
-### Bug fixes
+### Linux
 
-#### 1. `math_hash`: wrong integer width for large coordinates
-
-Java evaluates `(long)(x * 3129871)` as a **32-bit** multiply that wraps before being sign-extended to 64 bits. The original port cast `x` to `i64` before multiplying, producing wrong results for any `|x| > ~688` where 32-bit overflow would have occurred.
-
-```rust
-// Wrong: multiplies in 64-bit, no overflow
-let term_x = (x as i64) * 3_129_871;
-
-// Correct: wraps in 32-bit, then sign-extends, matching Java
-let term_x = x.wrapping_mul(3_129_871) as i64;
-```
-
-This was a silent correctness bug: the tool would find a result, but not the right one, for any coordinate outside a small central region.
-
-#### 2. Thread pool: per-batch allocation
-
-The previous port wrapped each batch's coordinate arrays in `Arc<Vec<i32>>`, which allocated and copied 512 KB of data on every 65 536-position chunk. Since the main thread blocks synchronously until all workers finish, the underlying arrays are stable for the entire batch, so no copy is needed.
-
----
-
-### Performance improvements
-
-| Change | Detail |
-|---|---|
-| **rayon replaces the custom thread pool** | Eliminated ~70 lines of `mpsc` channel plumbing. `find_first` handles early exit, empty-range dispatching, and spiral-order correctness automatically. |
-| **No per-batch heap allocation** | The 512 KB `Vec` copy per chunk is gone entirely; workers borrow the chunk buffer directly through rayon's scoped parallelism. |
-| **Cross-worker early exit** | As soon as any worker finds a match, rayon signals the others to stop. The custom pool had no cancellation mechanism. |
-| **`sort_by_cached_key`** | Sort keys are computed exactly once per block. The previous version recomputed them on every comparison; an intermediate version built a `Vec<(f64, Block)>` and stripped it back out (two extra allocations and two extra passes). |
-| **AoS chunk buffer** | Two parallel `Vec<i32>` (`chunk_x`, `chunk_z`) replaced by one `Vec<(i32, i32)>`. Each position's data is now adjacent in memory, reducing cache pressure in the hot loop. |
-| **Dead variable removed** | The `filled` counter was always equal to `CHUNK_SIZE` when passed to the search, so the loop body always ran to completion. Removed; `find_first` now ranges directly over `0..CHUNK_SIZE`. |
-| **Blocks immutable after sort** | The `mut` on `blocks` is shadowed away after sorting so the compiler enforces that nothing downstream can accidentally mutate the search list. |
-| **Trivially-informationless blocks filtered** | Blocks whose outcome is guaranteed (always-bedrock declared as bedrock, or never-bedrock declared as air) are removed before the search. They pass every check trivially and contribute nothing to candidate rejection. |
-
----
-
-## Building
-
-Requires [Rust](https://rustup.rs) (stable, 1.70+).
+> [!NOTE]
+> To build this project, you must have Rust and Cargo installed.
 
 ```bash
-git clone https://github.com/<you>/bedrockformation-rs
-cd bedrockformation-rs
+# Firstly, clone the repo.
+git clone https://github.com/akai-hana/minecraft-bedrock-finder
+
+# Go into the cloned directory...
+cd minecraft-bedrock-finder
+
+# ... And finally compile the project.
 cargo build --release
 ```
 
-The binary will be at `target/release/bedrockformation`.
+And that's it!
 
-**`Cargo.toml` dependencies:**
+Now you can then execute it by doing:
 
-```toml
-[dependencies]
-md5   = "0.7"
-rayon = "1"
-```
-
----
-
-## Usage
-
-```
-bedrockformation <seed> <x:z> <floor|roof> [x,y,z:bedrock ...]
-```
-
-### Arguments
-
-| Argument | Type | Description |
-|---|---|---|
-| `seed` | `i64` | World seed |
-| `x:z` | `i32:i32` | Spiral search center (your approximate coordinates) |
-| `floor\|roof` | enum | Which bedrock layer to search |
-| `x,y,z:bedrock` | repeatable | A block in the formation. `bedrock` is `1` (bedrock) or `0` (air). Coordinates are relative to the unknown origin. |
-
-Blocks at Y=−64 (floor) or Y=127 (roof) are always bedrock and carry no information, so use blocks at the probabilistic layers for best results. The more blocks you provide, the rarer the formation and the faster candidates are rejected.
-
-### Examples
-
-**Minimal (one block, floor):**
 ```bash
-./target/release/bedrockformation 124352345 0:0 floor 0,-63,0:1
+./target/release/bedrockformation
 ```
 
-**Three-block formation, floor:**
-```bash
-./target/release/bedrockformation 124352345 0:0 floor \
-  0,-63,0:1  1,-62,0:1  0,-63,1:0
-```
-Block at `(0,-63,0)` should be bedrock, `(1,-62,0)` should be bedrock, `(0,-63,1)` should be air.
+..., where the binary is located.
 
-**Six-block formation, roof, far from origin:**
-```bash
-./target/release/bedrockformation 112233445 5000:5000 roof \
-  0,125,0:1  1,125,0:0  0,126,0:1  -1,125,0:1  0,125,1:0  1,126,0:1
-```
+<sub>*(or just going there and double clicking the file)*</sub>
 
-**Output:**
-```
-BedrockBlock{x=0, y=-63, z=0, shouldBeBedrock=true, p=0.800}
-BedrockBlock{x=1, y=-62, z=0, shouldBeBedrock=true, p=0.600}
-BedrockBlock{x=0, y=-63, z=1, shouldBeBedrock=false, p=0.800}
-Found Bedrock Formation at X:-142 Z:237
-```
+## Lore
 
-The tool prints the blocks sorted by descending mismatch probability (most-likely-to-reject first, so it short-circuits as early as possible), then prints the result once found.
+This project started as a Rust port of [Developer-Mike's Minecraft Bedrock Formation Finder](https://github.com/Developer-Mike/Minecraft-Bedrock-Formation-Finder-1.18).
 
-### Reading the bedrock layer
+Now, it could be considered entirely its own thing, featuring many new, very juicy features.
 
-1. Stand on the bedrock floor (or build up to the roof).
-2. Look straight down (or up) and record several blocks around you, noting whether each position is bedrock or air.
-3. Pick any block as your relative origin `(0, y, 0)`. All other coordinates are offsets from it.
-4. Use your approximate overworld coordinates as the search center `x:z`. The closer you are, the faster the search.
-5. Add as many blocks as you can, since each block roughly halves the number of false positives.
+## Features
+
+### GUI
+
+Most prominently, this program offers an intuitive GUI to search the bedrock patterns.
+
+(Photo (im too lazy ill do this later))
+
+The GUI is written using Iced, a library to make GUIs in Rust (the same library the guys at System76 use to write their COSMIC desktop)
+
+### GPU Acceleration
+
+This program offers two modes of computing the pattern searches: though CPU or GPU. 
+
+GPU acceleration speeds the searches nearly tenfold as compared to CPU mode _(depending on your GPU, but mostly the same),_ so it is advised to check the checkbox on the interface.
+
+Regardless, the CPU mode this program offers the is already way, WAY faster and plenty more optimized in comparison to the competition, completely decimating it in the process *(concrete benchmarks below if interested).*
+
+As an example, Developer-Mike's (originally this program's fork) version works really well, but since it was written in Java, and the search computation logic relies on OOP, the searches are inherently slow. In comparison, this program is written in Rust, and offers multi-threading, parallelism, and GPU acceleration, making the search absurdly fast.
+
+(Benchmarks of stuff (im still lazy))
 
 ---
 
 ## Benchmarks
 
+> [!WARNING]
+> These benchmarks are outdated.
+> Once they are updated, you won't see this warning anymore. Until then, please wait a bit.
+
 Performance comparison between the original Java implementation and this Rust port. All times are `real` wall-clock time recorded with the shell `time` builtin. The Rust binary was compiled with `cargo build --release`. Each command was run cold (no warm JVM, no OS file cache).
 
-**Machine:** <!-- e.g. Apple M2 Pro, 10-core / Arch Linux -->  
-**Java version:** <!-- e.g. OpenJDK 21.0.3 -->  
-**rustc version:** <!-- e.g. rustc 1.78.0 -->
+**CPU: Ryzen 9 6900HX**
+**GPU: RX 6850M XT**
+**RAM: 32GB DDR4**
+**Java version: <TODO>**
+**rustc version: <TODO>**
 
 ---
 
@@ -322,4 +234,4 @@ time ./target/release/bedrockformation 556677889 -10000:-10000 roof \
 ## Credits
 
 - [Developer-Mike](https://github.com/Developer-Mike) for the original Java implementation and RNG reverse-engineering
-- Rust port, bug fixes, and performance work by <!-- your name/handle -->
+- Rust port, bug fixes, performance work, GUI, GPU acceleration, and everything else in-between by [akai-hana](https://github.com/akai-hana) <sub>*AKA. me :-)*</sub> and commisioned by [More$!@#%](https://github.com/MoreOrgasm) <sub>sorry, not allowed to spell that one :-(</sub>https://github.com/MoreOrgasm
