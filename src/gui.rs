@@ -621,59 +621,88 @@ impl Application for App {
         // Scale a fixed pixel value by the current zoom factor.
         let sc = |v: f32| v * s;
 
+        // ── Zoom controls (top-right corner) ───────────────────────────────
+        let zoom_row = row![
+            text(format!("Zoom: {:.0}%", self.ui_scale * 100.0)).size(sc(12.0) as u16),
+            Space::with_width(Length::Fixed(sc(6.0))),
+            button(text("\u{2212}").size(sc(14.0) as u16))
+                .on_press(Message::ZoomOut)
+                .style(theme::Button::Secondary)
+                .padding([sc(3.0) as u16, sc(10.0) as u16]),
+            button(text("+").size(sc(14.0) as u16))
+                .on_press(Message::ZoomIn)
+                .style(theme::Button::Secondary)
+                .padding([sc(3.0) as u16, sc(10.0) as u16]),
+        ].spacing(sc(4.0) as u16).align_items(Alignment::Center);
+
+        // ── Section: Search parameters ──────────────────────────────────────
         let seed_row = row![
-            text("World Seed").size(sc(16.0) as u16).width(Length::Fixed(sc(130.0))),
+            text("World Seed").size(sc(14.0) as u16).width(Length::Fixed(sc(120.0))),
             text_input("e.g. 124352345", &self.seed)
                 .on_input(Message::SeedChanged)
-                .size(sc(16.0) as u16)
+                .size(sc(15.0) as u16)
                 .width(Length::Fill)
                 .padding(sc(8.0) as u16),
-        ].spacing(sc(12.0) as u16).align_items(Alignment::Center);
+        ].spacing(sc(10.0) as u16).align_items(Alignment::Center);
 
         let center_row = row![
-            text("Search Center").size(sc(16.0) as u16).width(Length::Fixed(sc(130.0))),
-            text("X").size(sc(16.0) as u16),
-            text_input("0", &self.center_x).on_input(Message::CenterXChanged).size(sc(16.0) as u16).width(Length::Fixed(sc(90.0))).padding(sc(8.0) as u16),
-            text("Z").size(sc(16.0) as u16),
-            text_input("0", &self.center_z).on_input(Message::CenterZChanged).size(sc(16.0) as u16).width(Length::Fixed(sc(90.0))).padding(sc(8.0) as u16),
-        ].spacing(sc(10.0) as u16).align_items(Alignment::Center);
+            text("Search Center").size(sc(14.0) as u16).width(Length::Fixed(sc(120.0))),
+            text("X").size(sc(13.0) as u16),
+            text_input("0", &self.center_x)
+                .on_input(Message::CenterXChanged)
+                .size(sc(15.0) as u16)
+                .width(Length::Fixed(sc(90.0)))
+                .padding(sc(8.0) as u16),
+            Space::with_width(Length::Fixed(sc(8.0))),
+            text("Z").size(sc(13.0) as u16),
+            text_input("0", &self.center_z)
+                .on_input(Message::CenterZChanged)
+                .size(sc(15.0) as u16)
+                .width(Length::Fixed(sc(90.0)))
+                .padding(sc(8.0) as u16),
+        ].spacing(sc(8.0) as u16).align_items(Alignment::Center);
 
         let type_row = row![
-            text("Bedrock Layer").size(sc(16.0) as u16).width(Length::Fixed(sc(130.0))),
-            radio("Floor (Y -64 to -59)", BedrockType::Floor, Some(self.bedrock_type), Message::TypeChanged).text_size(sc(16.0) as u16),
-            Space::with_width(Length::Fixed(sc(20.0))),
-            radio("Roof  (Y 123 to 128)", BedrockType::Roof,  Some(self.bedrock_type), Message::TypeChanged).text_size(sc(16.0) as u16),
+            text("Bedrock Layer").size(sc(14.0) as u16).width(Length::Fixed(sc(120.0))),
+            radio("Floor  (Y \u{2212}64 to \u{2212}59)", BedrockType::Floor, Some(self.bedrock_type), Message::TypeChanged)
+                .text_size(sc(14.0) as u16),
+            Space::with_width(Length::Fixed(sc(24.0))),
+            radio("Roof  (Y 123 to 128)", BedrockType::Roof, Some(self.bedrock_type), Message::TypeChanged)
+                .text_size(sc(14.0) as u16),
         ].spacing(sc(10.0) as u16).align_items(Alignment::Center);
 
-        // Grid size + offset controls
+        // ── Section: Pattern grid ───────────────────────────────────────────
+
+        // Grid size + offset on one compact row, with a visual gap between the
+        // two groups (size vs. offset) instead of just spacing.
         let grid_controls = row![
-            text("Grid Size").size(sc(16.0) as u16).width(Length::Fixed(sc(80.0))),
-            text("Cols").size(sc(16.0) as u16),
+            text("Grid Size").size(sc(13.0) as u16).width(Length::Fixed(sc(68.0))),
+            text("Cols").size(sc(13.0) as u16),
             text_input("8", &self.grid_cols_str)
                 .on_input(Message::GridColsChanged)
-                .size(sc(16.0) as u16)
+                .size(sc(14.0) as u16)
                 .width(Length::Fixed(sc(46.0)))
-                .padding(sc(7.0) as u16),
-            text("Rows").size(sc(16.0) as u16),
+                .padding(sc(6.0) as u16),
+            text("Rows").size(sc(13.0) as u16),
             text_input("8", &self.grid_rows_str)
                 .on_input(Message::GridRowsChanged)
-                .size(sc(16.0) as u16)
+                .size(sc(14.0) as u16)
                 .width(Length::Fixed(sc(46.0)))
-                .padding(sc(7.0) as u16),
-            Space::with_width(Length::Fixed(sc(20.0))),
-            text("Offset").size(sc(16.0) as u16).width(Length::Fixed(sc(48.0))),
-            text("X").size(sc(16.0) as u16),
+                .padding(sc(6.0) as u16),
+            Space::with_width(Length::Fixed(sc(24.0))),
+            text("Offset").size(sc(13.0) as u16).width(Length::Fixed(sc(46.0))),
+            text("X").size(sc(13.0) as u16),
             text_input("0", &self.grid_offset_x)
                 .on_input(Message::GridOffsetXChanged)
-                .size(sc(16.0) as u16)
+                .size(sc(14.0) as u16)
                 .width(Length::Fixed(sc(58.0)))
-                .padding(sc(7.0) as u16),
-            text("Z").size(sc(16.0) as u16),
+                .padding(sc(6.0) as u16),
+            text("Z").size(sc(13.0) as u16),
             text_input("0", &self.grid_offset_z)
                 .on_input(Message::GridOffsetZChanged)
-                .size(sc(16.0) as u16)
+                .size(sc(14.0) as u16)
                 .width(Length::Fixed(sc(58.0)))
-                .padding(sc(7.0) as u16),
+                .padding(sc(6.0) as u16),
         ].spacing(sc(8.0) as u16).align_items(Alignment::Center);
 
         // Y-layer tab strip. Tabs marked with * contain at least one non-Unknown cell.
@@ -681,29 +710,29 @@ impl Application for App {
         let mut y_row: Row<'_, Message> = Row::new()
             .spacing(sc(6.0) as u16)
             .align_items(Alignment::Center)
-            .push(text("Y Layer").size(sc(16.0) as u16).width(Length::Fixed(sc(70.0))));
+            .push(text("Y Layer").size(sc(13.0) as u16).width(Length::Fixed(sc(60.0))));
         for (i, &y) in ys.iter().enumerate() {
             let has_data = self.grid_cells[i].iter()
                 .any(|r| r.iter().any(|&c| c != CellState::Unknown));
             let label = if has_data { format!("{}*", y) } else { y.to_string() };
             let btn = if i == self.grid_y_idx {
-                // Active tab: no on_press, so clicking it again is a no-op
+                // Active tab: no on_press so clicking it again is a no-op.
                 button(text(label).size(sc(13.0) as u16))
                     .style(theme::Button::Primary)
-                    .padding([sc(5.0) as u16, sc(10.0) as u16])
+                    .padding([sc(5.0) as u16, sc(14.0) as u16])
             } else {
                 button(text(label).size(sc(13.0) as u16))
                     .style(theme::Button::Secondary)
                     .on_press(Message::GridYChanged(i))
-                    .padding([sc(5.0) as u16, sc(10.0) as u16])
+                    .padding([sc(5.0) as u16, sc(14.0) as u16])
             };
             y_row = y_row.push(btn);
         }
 
         // Cell grid
-        let mut grid_col: Column<'_, Message> = Column::new().spacing(sc(2.0) as u16);
+        let mut grid_col: Column<'_, Message> = Column::new().spacing(sc(3.0) as u16);
         for row_idx in 0..self.grid_rows {
-            let mut grid_row: Row<'_, Message> = Row::new().spacing(sc(2.0) as u16);
+            let mut grid_row: Row<'_, Message> = Row::new().spacing(sc(3.0) as u16);
             for col_idx in 0..self.grid_cols {
                 let state = self.grid_cells[self.grid_y_idx][row_idx][col_idx];
                 let (label, style) = match state {
@@ -713,66 +742,71 @@ impl Application for App {
                 };
                 let cell = mouse_area(
                     button(
-                            container(text(label).size(sc(15.0) as u16))
-                                .width(Length::Fill)
-                                .height(Length::Fill)
-                                .center_x()
-                                .center_y()
-                        )
-                        .on_press(Message::GridCellClicked(row_idx, col_idx))
-                        .style(style)
-                        .width(Length::Fixed(sc(30.0)))
-                        .height(Length::Fixed(sc(30.0)))
-                        .padding(0)
+                        container(text(label).size(sc(14.0) as u16))
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .center_x()
+                            .center_y()
+                    )
+                    .on_press(Message::GridCellClicked(row_idx, col_idx))
+                    .style(style)
+                    .width(Length::Fixed(sc(32.0)))
+                    .height(Length::Fixed(sc(32.0)))
+                    .padding(0)
                 ).on_right_press(Message::GridCellRightClicked(row_idx, col_idx));
                 grid_row = grid_row.push(cell);
             }
             grid_col = grid_col.push(grid_row);
         }
 
-        let rotate_row = row![
-            text("Rotate grid:").size(sc(12.0) as u16).width(Length::Fixed(sc(80.0))),
-            button(text("+90 deg CW").size(sc(13.0) as u16))
+        // Grid toolbar: rotate buttons on the left, action buttons on the right.
+        // Consolidating what were two separate rows into one saves vertical space
+        // and groups related controls more logically.
+        let grid_toolbar = row![
+            text("Rotate:").size(sc(12.0) as u16).width(Length::Fixed(sc(54.0))),
+            button(text("+90\u{00b0} CW").size(sc(12.0) as u16))
                 .on_press(Message::RotateCW)
                 .style(theme::Button::Secondary)
                 .padding([sc(4.0) as u16, sc(10.0) as u16]),
-            button(text("-90 deg CCW").size(sc(13.0) as u16))
+            button(text("\u{2212}90\u{00b0} CCW").size(sc(12.0) as u16))
                 .on_press(Message::RotateCCW)
+                .style(theme::Button::Secondary)
+                .padding([sc(4.0) as u16, sc(10.0) as u16]),
+            Space::with_width(Length::Fill),
+            button(text("Fill ? \u{2192} O").size(sc(12.0) as u16))
+                .on_press(Message::FillUnknownNonBedrockLayer)
+                .style(theme::Button::Secondary)
+                .padding([sc(4.0) as u16, sc(10.0) as u16]),
+            button(text("Clear all").size(sc(12.0) as u16))
+                .on_press(Message::ClearGrid)
                 .style(theme::Button::Secondary)
                 .padding([sc(4.0) as u16, sc(10.0) as u16]),
         ].spacing(sc(8.0) as u16).align_items(Alignment::Center);
 
+        // Legend: just the visual key. Actions moved to grid_toolbar above.
         let legend = row![
-            text("Click to cycle:").size(sc(12.0) as u16),
-            Space::with_width(Length::Fixed(sc(8.0))),
-            text("? Unknown").size(sc(12.0) as u16),
-            Space::with_width(Length::Fixed(sc(12.0))),
-            text("O Non-bedrock").size(sc(12.0) as u16),
-            Space::with_width(Length::Fixed(sc(12.0))),
-            text("X Bedrock").size(sc(12.0) as u16),
-            Space::with_width(Length::Fixed(sc(16.0))),
-            button(text("Set ? -> O for current layer").size(sc(12.0) as u16))
-                .on_press(Message::FillUnknownNonBedrockLayer)
-                .style(theme::Button::Secondary)
-                .padding([sc(4.0) as u16, sc(10.0) as u16]),
-            Space::with_width(Length::Fixed(sc(8.0))),
-            button(text("Clear grid").size(sc(12.0) as u16))
-                .on_press(Message::ClearGrid)
-                .style(theme::Button::Secondary)
-                .padding([sc(4.0) as u16, sc(10.0) as u16]),
+            text("Click:").size(sc(11.0) as u16),
+            Space::with_width(Length::Fixed(sc(6.0))),
+            text("?  Unknown").size(sc(11.0) as u16),
+            Space::with_width(Length::Fixed(sc(14.0))),
+            text("O  Non-bedrock").size(sc(11.0) as u16),
+            Space::with_width(Length::Fixed(sc(14.0))),
+            text("X  Bedrock").size(sc(11.0) as u16),
+            Space::with_width(Length::Fixed(sc(18.0))),
+            text("(right-click reverses)").size(sc(11.0) as u16),
         ].align_items(Alignment::Center);
 
+        // ── Section: Search options ─────────────────────────────────────────
         let all_rotations_row = row![
             checkbox(
-                "Search all 4 rotations (if north direction is unknown)",
+                "Search all 4 rotations  (north direction unknown)",
                 self.search_all_rotations,
             ).on_toggle(Message::ToggleAllRotations).text_size(sc(13.0) as u16),
         ].align_items(Alignment::Center);
 
-        // GPU toggle row - always shown. Availability is probed lazily
-        // when the user first enables it (see `Message::ToggleGpu`).
+        // GPU toggle row — always shown; probed lazily on first enable.
         let gpu_label = match &self.gpu_init {
-            GpuInitState::Probing     => "Checking for a GPU...".to_string(),
+            GpuInitState::Probing     => "Checking for a GPU\u{2026}".to_string(),
             GpuInitState::Unavailable => "GPU not available on this system".to_string(),
             _ if self.use_gpu => "GPU search enabled (faster)".to_string(),
             _ => "Use GPU for search".to_string(),
@@ -783,84 +817,107 @@ impl Application for App {
                 .text_size(sc(13.0) as u16),
         ].align_items(Alignment::Center);
 
+        // ── Search / Cancel buttons ─────────────────────────────────────────
+        // Search gets Primary style so it stands out; Cancel gets Destructive
+        // only while a search is actually running (communicates urgency).
         let search_btn = if is_searching {
-            button(text("Searching...").size(sc(16.0) as u16)).padding([sc(10.0) as u16, sc(28.0) as u16])
+            button(text("Searching\u{2026}").size(sc(16.0) as u16))
+                .padding([sc(10.0) as u16, sc(32.0) as u16])
         } else {
-            button(text("Search").size(sc(16.0) as u16)).on_press(Message::Search).padding([sc(10.0) as u16, sc(28.0) as u16])
+            button(text("Search").size(sc(16.0) as u16))
+                .on_press(Message::Search)
+                .style(theme::Button::Primary)
+                .padding([sc(10.0) as u16, sc(32.0) as u16])
         };
         let cancel_btn = if is_searching {
-            button(text("Cancel").size(sc(16.0) as u16)).on_press(Message::Cancel).padding([sc(10.0) as u16, sc(20.0) as u16])
+            button(text("Cancel").size(sc(15.0) as u16))
+                .on_press(Message::Cancel)
+                .style(theme::Button::Destructive)
+                .padding([sc(10.0) as u16, sc(22.0) as u16])
         } else {
-            button(text("Cancel").size(sc(16.0) as u16)).padding([sc(10.0) as u16, sc(20.0) as u16])
+            button(text("Cancel").size(sc(15.0) as u16))
+                .style(theme::Button::Secondary)
+                .padding([sc(10.0) as u16, sc(22.0) as u16])
         };
 
+        // ── Status bar ──────────────────────────────────────────────────────
         let status_msg = match &self.status {
-            SearchStatus::Idle              => text("Ready when you are.").size(sc(16.0) as u16),
-            SearchStatus::Searching(area)   => text(format!("Searching {}...", area)).size(sc(16.0) as u16),
-            SearchStatus::Cancelled(secs)   => text(format!("Search cancelled after {:.1}s.", secs)).size(sc(16.0) as u16),
-            SearchStatus::Found(x, z, secs) => text(format!("Found at X: {}   Z: {}   ({:.1}s)", x, z, secs)).size(sc(18.0) as u16),
-            SearchStatus::Error(e)          => text(format!("Error: {}", e)).size(sc(16.0) as u16),
+            SearchStatus::Idle              => text("Ready.").size(sc(15.0) as u16),
+            SearchStatus::Searching(area)   => text(format!("Searching {}\u{2026}", area)).size(sc(15.0) as u16),
+            SearchStatus::Cancelled(secs)   => text(format!("Cancelled after {:.1}s.", secs)).size(sc(15.0) as u16),
+            SearchStatus::Found(x, z, secs) => text(format!("Found at  X: {}   Z: {}   ({:.1}s)", x, z, secs)).size(sc(17.0) as u16),
+            SearchStatus::Error(e)          => text(format!("Error: {}", e)).size(sc(15.0) as u16),
         };
 
-        let zoom_row = row![
-            text(format!("Zoom: {:.0}%", self.ui_scale * 100.0)).size(sc(12.0) as u16),
-            Space::with_width(Length::Fixed(sc(8.0))),
-            button(text("-").size(sc(14.0) as u16))
-                .on_press(Message::ZoomOut)
-                .style(theme::Button::Secondary)
-                .padding([sc(3.0) as u16, sc(10.0) as u16]),
-            button(text("+").size(sc(14.0) as u16))
-                .on_press(Message::ZoomIn)
-                .style(theme::Button::Secondary)
-                .padding([sc(3.0) as u16, sc(10.0) as u16]),
-        ].spacing(sc(4.0) as u16).align_items(Alignment::Center);
-
+        // ── Layout assembly ─────────────────────────────────────────────────
         let content = Column::new()
-            .spacing(sc(2.0) as u16)
-            .padding(sc(16.0) as u16)
+            .spacing(0)
+            .padding(sc(18.0) as u16)
             .max_width(sc(760.0))
+
+            // Title bar
             .push(
                 row![
-                    text("Bedrock Formation Finder").size(sc(26.0) as u16),
+                    text("Bedrock Formation Finder").size(sc(24.0) as u16),
                     Space::with_width(Length::Fill),
                     zoom_row,
                 ].align_items(Alignment::Center)
             )
-            .push(Space::with_height(Length::Fixed(sc(4.0))))
+            .push(Space::with_height(Length::Fixed(sc(12.0))))
             .push(horizontal_rule(1))
-            .push(Space::with_height(Length::Fixed(sc(6.0))))
+            .push(Space::with_height(Length::Fixed(sc(12.0))))
+
+            // Search parameters
             .push(seed_row)
+            .push(Space::with_height(Length::Fixed(sc(8.0))))
             .push(center_row)
+            .push(Space::with_height(Length::Fixed(sc(8.0))))
             .push(type_row)
-            .push(Space::with_height(Length::Fixed(sc(6.0))))
+            .push(Space::with_height(Length::Fixed(sc(14.0))))
             .push(horizontal_rule(1))
-            .push(Space::with_height(Length::Fixed(sc(6.0))))
+            .push(Space::with_height(Length::Fixed(sc(12.0))))
+
+            // Pattern grid
             .push(grid_controls)
-            .push(Space::with_height(Length::Fixed(sc(6.0))))
+            .push(Space::with_height(Length::Fixed(sc(10.0))))
             .push(y_row)
-            .push(Space::with_height(Length::Fixed(sc(4.0))))
-            .push(grid_col)
-            .push(Space::with_height(Length::Fixed(sc(4.0))))
-            .push(rotate_row)
-            .push(Space::with_height(Length::Fixed(sc(4.0))))
-            .push(legend)
             .push(Space::with_height(Length::Fixed(sc(6.0))))
+            .push(grid_col)
+            .push(Space::with_height(Length::Fixed(sc(8.0))))
+            .push(grid_toolbar)
+            .push(Space::with_height(Length::Fixed(sc(6.0))))
+            .push(legend)
+            .push(Space::with_height(Length::Fixed(sc(14.0))))
+            .push(horizontal_rule(1))
+            .push(Space::with_height(Length::Fixed(sc(12.0))))
+
+            // Search options
             .push(all_rotations_row)
-            .push(Space::with_height(Length::Fixed(sc(6.0))));
-
-        // Always push the GPU row (availability is probed lazily on toggle).
-        let content = content
+            .push(Space::with_height(Length::Fixed(sc(8.0))))
             .push(gpu_row)
-            .push(Space::with_height(Length::Fixed(sc(6.0))));
+            .push(Space::with_height(Length::Fixed(sc(16.0))))
+            .push(horizontal_rule(1))
+            .push(Space::with_height(Length::Fixed(sc(16.0))))
 
-        let content = content
+            // Search actions
             .push(
-                container(row![search_btn, cancel_btn].spacing(16).align_items(Alignment::Center))
+                container(
+                    row![
+                        search_btn,
+                        Space::with_width(Length::Fixed(sc(12.0))),
+                        cancel_btn,
+                    ].align_items(Alignment::Center)
+                )
+                .width(Length::Fill)
+                .center_x()
+            )
+            .push(Space::with_height(Length::Fixed(sc(12.0))))
+            .push(
+                container(status_msg)
                     .width(Length::Fill)
                     .center_x()
-            )
-            .push(Space::with_height(Length::Fixed(sc(8.0))))
-            .push(container(status_msg).width(Length::Fill).padding([sc(8.0) as u16, sc(14.0) as u16]));
+                    .padding([sc(10.0) as u16, sc(16.0) as u16])
+            );
 
         container(scrollable(content)).width(Length::Fill).height(Length::Fill).center_x().into()
     }
