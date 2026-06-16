@@ -19,12 +19,11 @@ use crate::core::{
     compute_probability, prob_to_threshold,
     generate_rotations, area_label_from_l, run_search,
 };
-use crate::gpu::GpuContext;
 
 // GUI - types
 
 /// State of one cell in the constraint grid.
-/// Cycles through Unknown -> NonBedrock -> Bedrock -> Unknown on each click.
+/// Cycles Unknown -> NonBedrock -> Bedrock -> Unknown on each click.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum CellState { #[default] Unknown, NonBedrock, Bedrock }
 
@@ -45,9 +44,9 @@ impl CellState {
     }
 }
 
-/// The four Y values containing probabilistic bedrock for each layer type,
-/// ordered with the most-air end first (-60 ... -63 for floor).
-/// Y=-64 (always solid) and Y=-59 (always air) are excluded as redundant.
+/// The four Y values that can contain probabilistic bedrock for each layer type.
+/// Ordered left-to-right on the tab strip: most-air end first (-60 ... -63 for floor).
+/// -64 (always bedrock) and -59 (always air) are excluded as redundant.
 fn y_values(bt: BedrockType) -> [i32; 4] {
     match bt {
         BedrockType::Floor => [-60, -61, -62, -63],
@@ -62,9 +61,9 @@ fn make_grid(rows: usize, cols: usize) -> Vec<Vec<Vec<CellState>>> {
 
 // Grid rotation helpers
 
-/// Rotate all Y-layers 90 degrees clockwise.
-/// col -> X, row -> Z, so CW: new_col = rows-1-row, new_row = col.
-/// Resulting dimensions swap: new_rows = old_cols, new_cols = old_rows.
+/// Rotate all Y-layers 90º clockwise.
+/// In the grid, col maps to X and row maps to Z, so CW means: new_col = rows−1−row, new_row = col.
+/// The resulting grid has new_rows = old_cols, new_cols = old_rows.
 fn rotate_grid_cw(
     cells: &[Vec<Vec<CellState>>],
     rows: usize,
@@ -78,7 +77,7 @@ fn rotate_grid_cw(
             let mut new_layer = vec![vec![CellState::Unknown; new_cols]; new_rows];
             for r in 0..rows {
                 for c in 0..cols {
-                    // CW: (r, c) -> (c, rows-1-r)
+                    // CW: (r, c) -> new position (c, rows−1−r)
                     new_layer[c][rows - 1 - r] = layer[r][c];
                 }
             }
@@ -88,9 +87,9 @@ fn rotate_grid_cw(
     (new_cells, new_rows, new_cols)
 }
 
-/// Rotate all Y-layers 90 degrees counter-clockwise.
-/// CCW: (r, c) -> (cols-1-c, r).
-/// Resulting dimensions swap: new_rows = old_cols, new_cols = old_rows.
+/// Rotate all Y-layers 90º counter-clockwise.
+/// CCW: (r, c) -> new position (cols−1−c, r).
+/// The resulting grid has new_rows = old_cols, new_cols = old_rows.
 fn rotate_grid_ccw(
     cells: &[Vec<Vec<CellState>>],
     rows: usize,
@@ -104,7 +103,7 @@ fn rotate_grid_ccw(
             let mut new_layer = vec![vec![CellState::Unknown; new_cols]; new_rows];
             for r in 0..rows {
                 for c in 0..cols {
-                    // CCW: (r, c) -> (cols-1-c, r)
+                    // CCW: (r, c) -> new position (cols−1−c, r)
                     new_layer[cols - 1 - c][r] = layer[r][c];
                 }
             }
@@ -117,7 +116,7 @@ fn rotate_grid_ccw(
 #[derive(Debug, Clone, PartialEq)]
 enum SearchStatus {
     Idle,
-    /// Actively searching; carries a human-readable area label like "10k x 10k".
+    /// Actively searching; carries a human-readable area label like "10k × 10k".
     Searching(String),
     /// Search was cancelled; carries elapsed seconds.
     Cancelled(f64),
@@ -161,38 +160,8 @@ pub struct App {
     /// per-callback handler doesn't need to call `sqrt` every time.
     area_label_l:           i64,
     /// Spiral index at which `area_label_l` next needs to increment
-    /// (= 4L^2+4L+1 for the current `area_label_l`).
+    /// (= 4L²+4L+1 for the current `area_label_l`).
     area_label_next_thresh: i64,
-    /// GPU compute context. Initialisation is deferred until the user first
-    /// enables GPU search, since `GpuContext::new()` probes the graphics
-    /// driver and may spin up background threads that compete with Rayon.
-    /// See `Message::ToggleGpu` and `Message::GpuInitialized`.
-    gpu_init: GpuInitState,
-    /// Whether the GPU search path is currently enabled by the user.
-    use_gpu:  bool,
-    /// Set while a GPU probe triggered by enabling the checkbox is in
-    /// flight, so that `Message::GpuInitialized` knows whether to flip
-    /// `use_gpu` on once the probe completes.
-    pending_gpu_enable: bool,
-}
-
-/// Lazy GPU initialisation state. The GPU adapter/device is only probed the
-/// first time the user enables the "Use GPU" checkbox.
-#[derive(Debug, Default)]
-enum GpuInitState {
-    /// No probe has been attempted yet.
-    #[default]
-    NotProbed,
-    /// A probe is currently running (`GpuContext::new()` in flight).
-    Probing,
-    /// A suitable GPU adapter was found and initialised.
-    Ready(Arc<GpuContext>),
-    /// GPU was probed and found, but the user has disabled it. The device is
-    /// dropped so its driver threads do not compete with Rayon. Re-enabling
-    /// GPU search will re-create the context.
-    Capable,
-    /// No suitable GPU adapter was found; don't probe again.
-    Unavailable,
 }
 
 impl Default for App {
@@ -220,9 +189,6 @@ impl Default for App {
             ui_scale:      1.0,
             area_label_l:           0,
             area_label_next_thresh: 1,
-            gpu_init: GpuInitState::NotProbed,
-            use_gpu:  false,
-            pending_gpu_enable: false,
         }
     }
 }
@@ -242,17 +208,12 @@ pub enum Message {
     GridCellClicked(usize, usize),
     /// Cycle the state of cell (row, col) in reverse (right-click).
     GridCellRightClicked(usize, usize),
-    /// Rotate all Y-layers 90 degrees clockwise (X->Z, Z->-X).
+    /// Rotate all Y-layers 90º clockwise (X->Z, Z->−X).
     RotateCW,
-    /// Rotate all Y-layers 90 degrees counter-clockwise (X->-Z, Z->X).
+    /// Rotate all Y-layers 90º counter-clockwise (X->−Z, Z->X).
     RotateCCW,
     /// Toggle whether the search tries all 4 rotations of the pattern.
     ToggleAllRotations(bool),
-    /// Toggle whether the GPU compute path is used for the coarse search.
-    ToggleGpu(bool),
-    /// Result of an async GPU probe triggered by first enabling `ToggleGpu`.
-    /// `None` means no compatible GPU adapter/device was found.
-    GpuInitialized(Option<Arc<GpuContext>>),
     Search,
     Cancel,
     /// Fired periodically during a search with the farthest spiral index checked so far.
@@ -275,10 +236,6 @@ impl Application for App {
     type Flags   = ();
 
     fn new(_flags: ()) -> (Self, Command<Message>) {
-        // GPU initialisation is deferred until the user enables GPU search
-        // (see `Message::ToggleGpu`) so that CPU-only runs never pay the
-        // cost - or risk the driver-thread contention - of probing for a
-        // GPU adapter.
         (App::default(), Command::none())
     }
 
@@ -397,67 +354,6 @@ impl Application for App {
                 Command::none()
             }
 
-            Message::ToggleGpu(v) => {
-                if !v {
-                    self.use_gpu = false;
-                    // If the GPU context is alive, drop it now so that the
-                    // wgpu driver background threads are torn down and stop
-                    // competing with Rayon workers for CPU cores. Transition
-                    // to `Capable` so we know we can re-create the context
-                    // without probing again if the user re-enables GPU search.
-                    if matches!(self.gpu_init, GpuInitState::Ready(_)) {
-                        self.gpu_init = GpuInitState::Capable;
-                    }
-                    return Command::none();
-                }
-                match &self.gpu_init {
-                    GpuInitState::Ready(_) => {
-                        self.use_gpu = true;
-                        Command::none()
-                    }
-                    GpuInitState::Unavailable => {
-                        // Already probed once and found nothing; don't probe again.
-                        self.use_gpu = false;
-                        Command::none()
-                    }
-                    GpuInitState::Probing => Command::none(),
-                    // GPU was available before but the context was released
-                    // when the user disabled it. Re-create it now.
-                    GpuInitState::Capable |
-                    GpuInitState::NotProbed => {
-                        // First enable (or re-enable after a prior disable):
-                        // probe for a GPU adapter asynchronously so the UI
-                        // does not block. `use_gpu` is set once the probe
-                        // completes successfully.
-                        self.gpu_init = GpuInitState::Probing;
-                        self.pending_gpu_enable = true;
-                        Command::perform(
-                            async { GpuContext::new().await.map(Arc::new) },
-                            Message::GpuInitialized,
-                        )
-                    }
-                }
-            }
-
-            Message::GpuInitialized(ctx) => {
-                match ctx {
-                    Some(ctx) => {
-                        self.gpu_init = GpuInitState::Ready(ctx);
-                        if self.pending_gpu_enable { self.use_gpu = true; }
-                    }
-                    None => {
-                        self.gpu_init = GpuInitState::Unavailable;
-                        self.use_gpu = false;
-                        if self.pending_gpu_enable {
-                            self.status = SearchStatus::Error(
-                                "No compatible GPU adapter was found.".into());
-                        }
-                    }
-                }
-                self.pending_gpu_enable = false;
-                Command::none()
-            }
-
             Message::Search => {
                 let seed = match self.seed.parse::<i64>() {
                     Ok(s)  => s,
@@ -500,25 +396,16 @@ impl Application for App {
                 // Shared atomic updated by the worker; polled by the subscription tick.
                 let progress_pos = Arc::new(AtomicI64::new(0));
                 self.progress_pos = Some(progress_pos.clone());
-                self.status = SearchStatus::Searching("0 x 0".into());
+                self.status = SearchStatus::Searching("0 × 0".into());
                 self.area_label_l = 0;
                 self.area_label_next_thresh = 1;
-                // Clone the GPU context Arc for the worker thread (cheap ref-count bump).
-                let gpu_ctx = if self.use_gpu {
-                    match &self.gpu_init {
-                        GpuInitState::Ready(ctx) => Some(ctx.clone()),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
                 Command::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
                             // Build the list of block-sets to search: either just
                             // the entered pattern, or all 4 rotations of it. The
                             // spiral is traversed exactly once regardless of how
-                            // many rotations are present - each candidate position
+                            // many rotations are present — each candidate position
                             // is checked against every rotation's block-set before
                             // moving on, so a match against *any* rotation ends
                             // the search immediately.
@@ -533,7 +420,6 @@ impl Application for App {
                                 rotations,
                                 cancel,
                                 Some(&|idx| { progress_pos.store(idx, Ordering::Relaxed); }),
-                                gpu_ctx,
                             )
                         })
                             .await
@@ -545,8 +431,8 @@ impl Application for App {
 
             Message::Cancel => {
                 if let Some(flag) = &self.cancel_flag { flag.store(true, Ordering::Relaxed); }
-                // Flip status immediately so the UI responds; SearchDone will
-                // report the precise elapsed time when it arrives.
+                // We don't know elapsed precisely on cancel; SearchDone will carry it.
+                // Just flip status so the UI reflects cancellation immediately.
                 self.status = SearchStatus::Cancelled(
                     self.search_start.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
                 );
@@ -556,11 +442,12 @@ impl Application for App {
             Message::SearchProgress(idx) => {
                 if matches!(self.status, SearchStatus::Searching(_)) {
                     if idx <= 0 {
-                        self.status = SearchStatus::Searching("0 x 0".into());
+                        self.status = SearchStatus::Searching("0 × 0".into());
                     } else {
-                        // The shell L only ever increases as idx grows, so step
-                        // it forward with integer arithmetic until idx falls
-                        // within the current shell's range.
+                        // batch_start_group (and thus idx) grows monotonically,
+                        // so the shell L only ever increases. Step it forward
+                        // algebraically (no sqrt) until idx is back within the
+                        // current shell's range.
                         while idx >= self.area_label_next_thresh {
                             self.area_label_l += 1;
                             let l = self.area_label_l;
@@ -618,7 +505,7 @@ impl Application for App {
     fn view(&self) -> Element<'_, Message> {
         let is_searching = matches!(self.status, SearchStatus::Searching(_));
         let s = self.ui_scale;
-        // Scale a fixed pixel value by the current zoom factor.
+        // Helper: scale a fixed pixel value by the zoom factor.
         let sc = |v: f32| v * s;
 
         let seed_row = row![
@@ -676,7 +563,8 @@ impl Application for App {
                 .padding(sc(7.0) as u16),
         ].spacing(sc(8.0) as u16).align_items(Alignment::Center);
 
-        // Y-layer tab strip. Tabs marked with * contain at least one non-Unknown cell.
+        // Y-layer tab strip
+        // Tabs marked with * have at least one non-Unknown cell.
         let ys = y_values(self.bedrock_type);
         let mut y_row: Row<'_, Message> = Row::new()
             .spacing(sc(6.0) as u16)
@@ -687,7 +575,7 @@ impl Application for App {
                 .any(|r| r.iter().any(|&c| c != CellState::Unknown));
             let label = if has_data { format!("{}*", y) } else { y.to_string() };
             let btn = if i == self.grid_y_idx {
-                // Active tab: no on_press, so clicking it again is a no-op
+                // Active tab: no on_press so it is not re-clickable
                 button(text(label).size(sc(13.0) as u16))
                     .style(theme::Button::Primary)
                     .padding([sc(5.0) as u16, sc(10.0) as u16])
@@ -732,11 +620,11 @@ impl Application for App {
 
         let rotate_row = row![
             text("Rotate grid:").size(sc(12.0) as u16).width(Length::Fixed(sc(80.0))),
-            button(text("+90 deg CW").size(sc(13.0) as u16))
+            button(text("+90º (Clockwise)").size(sc(13.0) as u16))
                 .on_press(Message::RotateCW)
                 .style(theme::Button::Secondary)
                 .padding([sc(4.0) as u16, sc(10.0) as u16]),
-            button(text("-90 deg CCW").size(sc(13.0) as u16))
+            button(text("−90º (Counter-clockwise)").size(sc(13.0) as u16))
                 .on_press(Message::RotateCCW)
                 .style(theme::Button::Secondary)
                 .padding([sc(4.0) as u16, sc(10.0) as u16]),
@@ -769,20 +657,6 @@ impl Application for App {
             ).on_toggle(Message::ToggleAllRotations).text_size(sc(13.0) as u16),
         ].align_items(Alignment::Center);
 
-        // GPU toggle row - always shown. Availability is probed lazily
-        // when the user first enables it (see `Message::ToggleGpu`).
-        let gpu_label = match &self.gpu_init {
-            GpuInitState::Probing     => "Checking for a GPU...".to_string(),
-            GpuInitState::Unavailable => "GPU not available on this system".to_string(),
-            _ if self.use_gpu => "GPU search enabled (faster)".to_string(),
-            _ => "Use GPU for search".to_string(),
-        };
-        let gpu_row: Row<'_, Message> = row![
-            checkbox(gpu_label, self.use_gpu)
-                .on_toggle(Message::ToggleGpu)
-                .text_size(sc(13.0) as u16),
-        ].align_items(Alignment::Center);
-
         let search_btn = if is_searching {
             button(text("Searching...").size(sc(16.0) as u16)).padding([sc(10.0) as u16, sc(28.0) as u16])
         } else {
@@ -805,7 +679,7 @@ impl Application for App {
         let zoom_row = row![
             text(format!("Zoom: {:.0}%", self.ui_scale * 100.0)).size(sc(12.0) as u16),
             Space::with_width(Length::Fixed(sc(8.0))),
-            button(text("-").size(sc(14.0) as u16))
+            button(text("−").size(sc(14.0) as u16))
                 .on_press(Message::ZoomOut)
                 .style(theme::Button::Secondary)
                 .padding([sc(3.0) as u16, sc(10.0) as u16]),
@@ -846,14 +720,7 @@ impl Application for App {
             .push(legend)
             .push(Space::with_height(Length::Fixed(sc(6.0))))
             .push(all_rotations_row)
-            .push(Space::with_height(Length::Fixed(sc(6.0))));
-
-        // Always push the GPU row (availability is probed lazily on toggle).
-        let content = content
-            .push(gpu_row)
-            .push(Space::with_height(Length::Fixed(sc(6.0))));
-
-        let content = content
+            .push(Space::with_height(Length::Fixed(sc(6.0))))
             .push(
                 container(row![search_btn, cancel_btn].spacing(16).align_items(Alignment::Center))
                     .width(Length::Fill)

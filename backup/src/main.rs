@@ -5,7 +5,6 @@
 /// Example: bedrockformation 124352345 0:0 floor 0,-63,0:1 1,-62,0:1 0,-63,1:0
 
 mod core;
-mod gpu;
 mod gui;
 
 use iced::{Application, Settings, window};
