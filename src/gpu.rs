@@ -42,16 +42,32 @@ pub struct SearchUniforms {
 }   // total: 48 bytes
 
 /// Must match `BlockData` in search.wgsl (32 bytes).
+///
+/// Instead of storing the raw `bx` and `bz` coordinates, this struct carries
+/// precomputed hash terms that the shader previously recomputed for every thread:
+///
+///   `bx_k    = (bx as u32).wrapping_mul(3_129_871)`
+///   `bz_k    = (bz as i64).wrapping_mul(116_129_781)` stored as (lo, hi) u32
+///
+/// Inside the shader the per-position contribution (`ox * K_x` and `oz * K_z`)
+/// is hoisted before the block loops, and the full x/z hash terms are obtained
+/// with a single cheap add per block instead of a full 64-bit multiply.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GpuBlock {
-    pub bx:                i32,
-    pub by:                i32,
-    pub bz:                i32,
-    pub prob_threshold:    u32,
-    pub should_be_bedrock: u32,
-    pub _pad:              [u32; 3],
-}
+    /// Precomputed `(bx as u32).wrapping_mul(3_129_871)`.
+    /// Inside the shader: `x_term = i32_to_u64(i32(ox_k_u32 + b.bx_k))`.
+    pub bx_k:              u32,   // offset  0
+    /// Raw Y coordinate.
+    pub by:                i32,   // offset  4
+    /// Low 32 bits of `(bz as i64).wrapping_mul(116_129_781)`.
+    pub bz_k_lo:           u32,   // offset  8
+    /// High 32 bits of `(bz as i64).wrapping_mul(116_129_781)`.
+    pub bz_k_hi:           u32,   // offset 12
+    pub prob_threshold:    u32,   // offset 16
+    pub should_be_bedrock: u32,   // offset 20
+    pub _pad:              [u32; 2], // offset 24-28 (pad to 32 bytes)
+}  // total: 32 bytes
 
 // Buffer size constants
 
@@ -67,7 +83,13 @@ pub struct GpuContext {
     device:      wgpu::Device,
     queue:       wgpu::Queue,
     pipeline:    wgpu::ComputePipeline,
-    bgl:         wgpu::BindGroupLayout,
+    /// Pre-built bind group reused every batch.
+    ///
+    /// The bind group references the buffer *objects*, not their contents.
+    /// Writing new data into `uniform_buf` and `result_buf` each batch is
+    /// perfectly valid - the bind group only needs to be rebuilt if the buffer
+    /// handles themselves change, which they never do here.
+    bind_group:  wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
     block_buf:   wgpu::Buffer,
     result_buf:  wgpu::Buffer,
@@ -196,7 +218,25 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
-        Some(Self { device, queue, pipeline, bgl, uniform_buf, block_buf, result_buf, staging_buf })
+        // Build the bind group once.  The three buffer *objects* are fixed for
+        // the lifetime of this GpuContext; only their contents change between
+        // batches.  Rebuilding the bind group on every `search_batch` call would
+        // incur driver-side descriptor-set allocation and layout validation for
+        // no reason.
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:   Some("bedrock_bg"),
+            layout:  &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: block_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: result_buf.as_entire_binding() },
+            ],
+        });
+        // `bgl` is no longer needed after the bind group and pipeline layout are
+        // built.  Let it drop here; the bind group holds an internal reference
+        // that keeps the layout alive as long as `bind_group` is live.
+
+        Some(Self { device, queue, pipeline, bind_group, uniform_buf, block_buf, result_buf, staging_buf })
     }
 
     /// Write the block data to the GPU buffer.
@@ -219,8 +259,8 @@ impl GpuContext {
     ///   - 48 bytes written to the uniform buffer
     ///   - 4 bytes read back via a staging buffer
     ///
-/// Block data must have been uploaded by a preceding `write_blocks` call
-    /// / it is not re-written here (blocks are constant within a `run_search`
+    /// Block data must have been uploaded by a preceding `write_blocks` call;
+    /// it is not re-written here (blocks are constant within a `run_search`
     /// call; uploading them once outside the loop saves significant bus
     /// bandwidth for long searches).
     ///
@@ -319,18 +359,9 @@ impl GpuContext {
         let sentinel: u32 = 0xFFFF_FFFF;
         self.queue.write_buffer(&self.result_buf, 0, bytes_of(&sentinel));
 
-        // 3. Bind group.
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   None,
-            layout:  &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.block_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.result_buf.as_entire_binding() },
-            ],
-        });
-
-        // 4. Encode, dispatch, copy result to staging.
+        // 3. Encode, dispatch, copy result to staging.
+        //    The bind group is already built and cached in `self.bind_group` -
+        //    no allocation or validation happens here.
         let mut enc = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("search_batch") },
         );
@@ -340,13 +371,13 @@ impl GpuContext {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         }
         enc.copy_buffer_to_buffer(&self.result_buf, 0, &self.staging_buf, 0, 4);
         self.queue.submit(std::iter::once(enc.finish()));
 
-        // 5. Single blocking readback - one poll per batch, not per chunk.
+        // 4. Single blocking readback - one poll per batch, not per chunk.
         //
         // A yield-loop over `Maintain::Poll` is used instead of `Maintain::Wait`
         // to avoid pinning the calling thread for the full GPU execution window.

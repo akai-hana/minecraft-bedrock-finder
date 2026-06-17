@@ -156,9 +156,9 @@ fn compute_deriver_seeds(seed: i64, bt: BedrockType) -> (i64, i64) {
     //    Both identifier strings are compile-time constants -> digest is compile-time
     //    constant -> no runtime MD5 computation needed.
     const FLOOR_MD5: [u8; 16] = [0xBB, 0xF7, 0x92, 0x8B, 0x7B, 0xF1, 0xD2, 0x85,
-                                  0xC4, 0xDC, 0x7C, 0xF9, 0x0E, 0x1B, 0x3B, 0x94]; // md5("minecraft:bedrock_floor")
+    0xC4, 0xDC, 0x7C, 0xF9, 0x0E, 0x1B, 0x3B, 0x94]; // md5("minecraft:bedrock_floor")
     const ROOF_MD5:  [u8; 16] = [0x8E, 0xBD, 0x4A, 0x1D, 0x13, 0x1D, 0x71, 0xCC,
-                                  0xC9, 0x84, 0xCF, 0xBB, 0x68, 0x4A, 0x26, 0xC4]; // md5("minecraft:bedrock_roof")
+    0xC9, 0x84, 0xCF, 0xBB, 0x68, 0x4A, 0x26, 0xC4]; // md5("minecraft:bedrock_roof")
     let bs = match bt {
         BedrockType::Floor => FLOOR_MD5,
         BedrockType::Roof  => ROOF_MD5,
@@ -333,7 +333,7 @@ struct Blocks {
     ///
     /// The x-coordinate path uses the Java `(long)(x * 3129871)` idiom:
     /// multiply in i32 (wrapping), then sign-extend to i64.  Because wrapping
-/// integer multiplication distributes over addition in Z/2^32Z
+    /// integer multiplication distributes over addition in Z/2^32Z
     /// / `(ox + bx) * K == ox * K + bx * K (mod 2^32)` - the ox * K term can be
     /// hoisted out of the block loop in i32 space, and bx * K is added inside.
     /// The sum is sign-extended to i64 afterwards, exactly matching the scalar.
@@ -345,7 +345,7 @@ struct Blocks {
     /// (e.g. all constraints come from y = -60).  Used by the hot-path kernels
     /// to hoist the per-block y broadcast **outside** the block loop.
     ///
-/// The compiler cannot prove loop-invariance from the SoA slice alone
+    /// The compiler cannot prove loop-invariance from the SoA slice alone
     /// / every `y_s[i]` access looks like a distinct load - so the hoist must be
     /// explicit.  When `None`, kernels fall back to loading `y_s[i]` per
     /// iteration as before.
@@ -604,9 +604,9 @@ mod simd_avx2 {
             let logical   = _mm256_srli_epi64(l, 16);
             let sign_mask = _mm256_cmpgt_epi64(_mm256_setzero_si256(), l);
             let top16     = _mm256_and_si256(
-                                sign_mask,
-                                _mm256_set1_epi64x(0xFFFF_0000_0000_0000_u64 as i64),
-                            );
+                sign_mask,
+                _mm256_set1_epi64x(0xFFFF_0000_0000_0000_u64 as i64),
+            );
             _mm256_or_si256(logical, top16)
         }
     }
@@ -1244,50 +1244,50 @@ fn run_chunk_batch<Fill, Check>(
 where
     Fill:  Fn(i32, i32, i32, i32, &mut [i32; 8], &mut [i32; 8]) + Sync,
     Check: Fn(&[i32; 8], &[i32; 8]) -> bool + Sync,
-{
-    (0..total_chunks).into_par_iter().find_first(|&ci| {
-        // Fast-path exit: if the user cancelled (or another super-batch found a
-        // result and set the flag), skip all work in this chunk and return false.
-        // All workers drain within one chunk (~8 192 positions, a few us), so
-        // find_first returns None and the outer loop hits the cancel check.
-        if cancel.load(Ordering::Relaxed) { return false; }
+    {
+        (0..total_chunks).into_par_iter().find_first(|&ci| {
+            // Fast-path exit: if the user cancelled (or another super-batch found a
+            // result and set the flag), skip all work in this chunk and return false.
+            // All workers drain within one chunk (~8 192 positions, a few us), so
+            // find_first returns None and the outer loop hits the cancel check.
+            if cancel.load(Ordering::Relaxed) { return false; }
 
-        let chunk_base_group = batch_base + ci * GROUPS_PER_CHUNK;
-        let base_k = chunk_base_group * 8;
+            let chunk_base_group = batch_base + ci * GROUPS_PER_CHUNK;
+            let base_k = chunk_base_group * 8;
 
-        let (mut x, mut z, mut l, mut j, mut dx, mut dz, mut next_leg_j) =
-            spiral_coords_with_state(base_k, start_x, start_z);
+            let (mut x, mut z, mut l, mut j, mut dx, mut dz, mut next_leg_j) =
+                spiral_coords_with_state(base_k, start_x, start_z);
 
-        let mut xs = [0i32; 8];
-        let mut zs = [0i32; 8];
+            let mut xs = [0i32; 8];
+            let mut zs = [0i32; 8];
 
-        let chunk_end_j = j + GROUPS_PER_CHUNK as i64 * 8;
-        let uniform = l > 0 && chunk_end_j < next_leg_j && chunk_end_j < 8 * l;
+            let chunk_end_j = j + GROUPS_PER_CHUNK as i64 * 8;
+            let uniform = l > 0 && chunk_end_j < next_leg_j && chunk_end_j < 8 * l;
 
-        if uniform {
-            // Fast path: entire chunk lies within one leg - direction is constant.
-            // Branch hoisted out of the loop so the inner loop contains only the
-            // uniform fill, with no dead code or repeated branch evaluation.
-            for _ in 0..GROUPS_PER_CHUNK {
-                uniform_fill(x, z, dx, dz, &mut xs, &mut zs);
-                x += 8 * dx;
-                z += 8 * dz;
-                if check_group(&xs, &zs) { return true; }
+            if uniform {
+                // Fast path: entire chunk lies within one leg - direction is constant.
+                // Branch hoisted out of the loop so the inner loop contains only the
+                // uniform fill, with no dead code or repeated branch evaluation.
+                for _ in 0..GROUPS_PER_CHUNK {
+                    uniform_fill(x, z, dx, dz, &mut xs, &mut zs);
+                    x += 8 * dx;
+                    z += 8 * dz;
+                    if check_group(&xs, &zs) { return true; }
+                }
+            } else {
+                for _ in 0..GROUPS_PER_CHUNK {
+                    fill_group_from_state(
+                        &mut x, &mut z, &mut l, &mut j,
+                        &mut dx, &mut dz, &mut next_leg_j,
+                        &mut xs, &mut zs,
+                        start_x, start_z,
+                    );
+                    if check_group(&xs, &zs) { return true; }
+                }
             }
-        } else {
-            for _ in 0..GROUPS_PER_CHUNK {
-                fill_group_from_state(
-                    &mut x, &mut z, &mut l, &mut j,
-                    &mut dx, &mut dz, &mut next_leg_j,
-                    &mut xs, &mut zs,
-                    start_x, start_z,
-                );
-                if check_group(&xs, &zs) { return true; }
-            }
-        }
-        false
-    })
-}
+            false
+        })
+    }
 
 // Block-level rotation helpers
 
@@ -1364,7 +1364,7 @@ pub fn generate_rotations(blocks: Vec<Block>) -> Vec<Vec<Block>> {
 /// purely to format the result.
 pub fn area_label_from_l(l: i64) -> String {
     let side = (2 * l + 1) as u64; // positions per axis
-    // Round to the nearest friendly unit
+                                   // Round to the nearest friendly unit
     let fmt_n = |n: u64| -> String {
         if n >= 1_000_000 { format!("{}M", (n + 500_000) / 1_000_000) }
         else if n >= 1_000 { format!("{}k", (n + 500) / 1_000) }
@@ -1409,13 +1409,13 @@ pub fn run_search(
         for b in &blocks {
             if b.probability >= 1.0 && !b.should_be_bedrock {
                 return Err(format!(
-                    "Block ({},{},{}) is always bedrock but declared as air. No solution exists.",
-                    b.x, b.y, b.z));
+                        "Block ({},{},{}) is always bedrock but declared as air. No solution exists.",
+                        b.x, b.y, b.z));
             }
             if b.probability <= 0.0 && b.should_be_bedrock {
                 return Err(format!(
-                    "Block ({},{},{}) is never bedrock but declared as bedrock. No solution exists.",
-                    b.x, b.y, b.z));
+                        "Block ({},{},{}) is never bedrock but declared as bedrock. No solution exists.",
+                        b.x, b.y, b.z));
             }
         }
 
@@ -1447,15 +1447,18 @@ pub fn run_search(
     let gpu_rotation_count = blocks_per_rotation.len() as u32;
     let gpu_blocks: Option<Vec<GpuBlock>> = gpu_ctx.as_ref().map(|_| {
         blocks_per_rotation.iter().flat_map(|rotation| {
-            rotation.iter().map(|b| GpuBlock {
-                bx:                b.x,
-                by:                b.y,
-                bz:                b.z,
-                prob_threshold:    b.prob_threshold as u32,
-                should_be_bedrock: b.should_be_bedrock as u32,
-                _pad:              [0; 3],
-            })
-        }).collect()
+            rotation.iter().map(|b| {
+                let bz_k = (b.z as i64).wrapping_mul(116_129_781);
+                GpuBlock {
+                    bx_k:              (b.x as u32).wrapping_mul(3_129_871),
+                    by:                b.y,
+                    bz_k_lo:           (bz_k as u64 & 0xFFFF_FFFF) as u32,
+                    bz_k_hi:           ((bz_k as u64) >> 32) as u32,
+                    prob_threshold:    b.prob_threshold as u32,
+                    should_be_bedrock: b.should_be_bedrock as u32,
+                    _pad:              [0; 2],
+                }
+            })}).collect()
     });
 
     let (dlo, dhi) = compute_deriver_seeds(seed, bt);
@@ -1489,7 +1492,7 @@ pub fn run_search(
 
     // Scalar uniform-fill closure (used on non-AVX2 path).
     let scalar_fill = |x: i32, z: i32, dx: i32, dz: i32,
-                        xs: &mut [i32; 8], zs: &mut [i32; 8]| {
+    xs: &mut [i32; 8], zs: &mut [i32; 8]| {
         for i in 0..8i32 {
             xs[i as usize] = x + i * dx;
             zs[i as usize] = z + i * dz;
@@ -1571,7 +1574,7 @@ pub fn run_search(
         unsafe fn avx2_position_terms(
             xs: &[i32; 8], zs: &[i32; 8],
         ) -> (::core::arch::x86_64::__m128i, ::core::arch::x86_64::__m128i,
-              ::core::arch::x86_64::__m256i, ::core::arch::x86_64::__m256i) {
+        ::core::arch::x86_64::__m256i, ::core::arch::x86_64::__m256i) {
             unsafe { simd_avx2::position_terms_x8_avx2(xs, zs) }
         }
 
@@ -1611,42 +1614,42 @@ pub fn run_search(
         } else {
             // CPU path (SIMD / scalar)
             match simd {
-            #[cfg(target_arch = "x86_64")]
-            SimdLevel::Avx512 => run_chunk_batch(
-                batch_base, super_batch_chunks, start_x, start_z, &cancel,
-                &|x: i32, z: i32, dx: i32, dz: i32,
-                  xs: &mut [i32; 8], zs: &mut [i32; 8]| {
-                    // SAFETY: AVX2 was verified by detect_simd (AVX-512 => AVX2).
-                    unsafe { avx2_fill(x, z, dx, dz, xs, zs); }
-                },
-                &|xs: &[i32; 8], zs: &[i32; 8]| {
-                    // Compute position terms once, then check each rotation.
-                    // SAFETY: AVX-512F+DQ verified by detect_simd.
-                    let (ox_term, oz_term) = unsafe { avx512_position_terms(xs, zs) };
-                    blocks_list.iter().any(|blocks| unsafe {
-                        avx512_check_with_terms(ox_term, oz_term, dlo, dhi, blocks)
-                    })
-                },
-            ),
-            #[cfg(target_arch = "x86_64")]
-            SimdLevel::Avx2 => run_chunk_batch(
-                batch_base, super_batch_chunks, start_x, start_z, &cancel,
-                &|x: i32, z: i32, dx: i32, dz: i32,
-                  xs: &mut [i32; 8], zs: &mut [i32; 8]| {
-                    // SAFETY: AVX2 verified by detect_simd.
-                    unsafe { avx2_fill(x, z, dx, dz, xs, zs); }
-                },
-                &|xs: &[i32; 8], zs: &[i32; 8]| {
-                    // Compute position terms once, then check each rotation.
-                    // SAFETY: AVX2 verified by detect_simd.
-                    let (oxlo, oxhi, ozlo, ozhi) = unsafe { avx2_position_terms(xs, zs) };
-                    blocks_list.iter().any(|blocks| unsafe {
-                        avx2_check_with_terms(oxlo, oxhi, ozlo, ozhi, dlo, dhi, blocks)
-                    })
-                },
-            ),
-            _ => run_chunk_batch(batch_base, super_batch_chunks, start_x, start_z, &cancel, &scalar_fill, &scalar_check),
-        }
+                #[cfg(target_arch = "x86_64")]
+                SimdLevel::Avx512 => run_chunk_batch(
+                    batch_base, super_batch_chunks, start_x, start_z, &cancel,
+                    &|x: i32, z: i32, dx: i32, dz: i32,
+                    xs: &mut [i32; 8], zs: &mut [i32; 8]| {
+                        // SAFETY: AVX2 was verified by detect_simd (AVX-512 => AVX2).
+                        unsafe { avx2_fill(x, z, dx, dz, xs, zs); }
+                    },
+                    &|xs: &[i32; 8], zs: &[i32; 8]| {
+                        // Compute position terms once, then check each rotation.
+                        // SAFETY: AVX-512F+DQ verified by detect_simd.
+                        let (ox_term, oz_term) = unsafe { avx512_position_terms(xs, zs) };
+                        blocks_list.iter().any(|blocks| unsafe {
+                            avx512_check_with_terms(ox_term, oz_term, dlo, dhi, blocks)
+                        })
+                    },
+                ),
+                #[cfg(target_arch = "x86_64")]
+                SimdLevel::Avx2 => run_chunk_batch(
+                    batch_base, super_batch_chunks, start_x, start_z, &cancel,
+                    &|x: i32, z: i32, dx: i32, dz: i32,
+                    xs: &mut [i32; 8], zs: &mut [i32; 8]| {
+                        // SAFETY: AVX2 verified by detect_simd.
+                        unsafe { avx2_fill(x, z, dx, dz, xs, zs); }
+                    },
+                    &|xs: &[i32; 8], zs: &[i32; 8]| {
+                        // Compute position terms once, then check each rotation.
+                        // SAFETY: AVX2 verified by detect_simd.
+                        let (oxlo, oxhi, ozlo, ozhi) = unsafe { avx2_position_terms(xs, zs) };
+                        blocks_list.iter().any(|blocks| unsafe {
+                            avx2_check_with_terms(oxlo, oxhi, ozlo, ozhi, dlo, dhi, blocks)
+                        })
+                    },
+                ),
+                _ => run_chunk_batch(batch_base, super_batch_chunks, start_x, start_z, &cancel, &scalar_fill, &scalar_check),
+            }
         };
 
         if let Some(ci) = found_chunk {
@@ -1687,7 +1690,7 @@ pub fn run_search(
                     unreachable!(
                         "SIMD reported a match in chunk {} group {} but scalar \
                          confirmation found no matching position - SIMD kernel bug",
-                        ci, g
+                         ci, g
                     );
                 }
             }
@@ -1696,7 +1699,7 @@ pub fn run_search(
             unreachable!(
                 "SIMD reported a match in chunk {} but scalar walk found no \
                  matching group - SIMD kernel bug",
-                ci
+                 ci
             );
         }
 

@@ -7,7 +7,7 @@
 use std::sync::{Arc, atomic::{AtomicBool, AtomicI64, Ordering}};
 
 use iced::{
-    Application, Command, Element, Event, Length, Subscription, Theme, Alignment,
+    Application, Command, Element, Event, Length, Subscription, Theme, Alignment, Color,
     executor, theme, time,
     keyboard::{self, Key},
     event,
@@ -20,6 +20,25 @@ use crate::core::{
     generate_rotations, area_label_from_l, run_search,
 };
 use crate::gpu::GpuContext;
+
+// GUI - theme
+//
+// A custom dark palette, replacing the built-in GruvboxDark theme. Note
+// `warning` and `danger` intentionally share the same teal (#007373) rather
+// than danger being red — `primary` (a deep red, #ac3232) is reserved for
+// the app's main affordances (the Search button, the active Y-layer tab,
+// and "non-bedrock" grid cells), while the teal marks the Cancel button and
+// "bedrock" grid cells.
+fn custom_palette() -> theme::Palette {
+    theme::Palette {
+        background: Color::from_rgb8(0x0d, 0x0d, 0x14),
+        text:       Color::from_rgb8(0xb9, 0xc0, 0xa8),
+        primary:    Color::from_rgb8(0xac, 0x32, 0x32),
+        // secondary:    Color::from_rgb8(0x00, 0x73, 0x73),
+        success:    Color::from_rgb8(0x52, 0x26, 0x3e),
+        danger:     Color::from_rgb8(0x00, 0x73, 0x73),
+    }
+}
 
 // GUI - types
 
@@ -195,6 +214,110 @@ enum GpuInitState {
     Unavailable,
 }
 
+// Pattern rarity helpers
+//
+// Computes the expected number of times the user's current pattern would
+// appear somewhere in a full Minecraft Java Edition world.
+//
+// IMPORTANT: this is an a-priori expectation over a randomly generated
+// world, not a claim about whether the pattern can exist. If the pattern
+// was copied from a real, already-inspected world, it already occurs there
+// at least once — a tiny E does not contradict that, it just means a
+// *second* (duplicate) occurrence elsewhere is essentially impossible.
+// See `fmt_rarity` for how this is worded for the user.
+//
+// Model
+// -----
+// Each filled cell (Bedrock or NonBedrock) at Y-layer y contributes an
+// independent probability factor:
+//   - Bedrock cell:     p_i  = compute_probability(y, bt)      ∈ {0.2, 0.4, 0.6, 0.8}
+//   - NonBedrock cell:  p_i  = 1 - compute_probability(y, bt)  ∈ {0.2, 0.4, 0.6, 0.8}
+//
+// The joint probability that a single world position (x, z) perfectly matches
+// the entire multi-layer pattern is:
+//   p_match = ∏ p_i
+//
+// Computed in log-space to handle patterns with dozens of constrained cells
+// without floating-point underflow.
+//
+// The expected number of occurrences across the world is then:
+//   E = N x p_match,  where N ≈ 60 000 000² ≈ 3.6 x 10¹⁵ (Java world border)
+//
+// Returns None when no cells are filled (pattern is completely unconstrained).
+// Returns Some((n_filled, ln_E)) otherwise, where ln_E may be ±∞ in edge
+// cases (handled by the display layer).
+fn pattern_occurrence_stats(
+    cells: &[Vec<Vec<CellState>>],
+    bt: BedrockType,
+) -> Option<(usize, f64)> {
+    let ys = y_values(bt);
+    let mut log_p: f64 = 0.0;
+    let mut n = 0usize;
+
+    for (y_idx, &y) in ys.iter().enumerate() {
+        let p = compute_probability(y, bt);
+        // p is strictly in (0,1) for the 4 probabilistic Y-layers shown in
+        // the grid; ln(p) and ln(1-p) are therefore both finite and negative.
+        for row in &cells[y_idx] {
+            for &cell in row {
+                match cell {
+                    CellState::Unknown => {}
+                    CellState::Bedrock    => { n += 1; log_p += p.ln(); }
+                    CellState::NonBedrock => { n += 1; log_p += (1.0 - p).ln(); }
+                }
+            }
+        }
+    }
+
+    if n == 0 {
+        return None;
+    }
+
+    // Java Edition world border: ±29 999 984 blocks ⟹ ~60 M x 60 M positions.
+    let ln_world: f64 = (60_000_000_f64 * 60_000_000_f64).ln(); // ≈ 35.82
+    Some((n, ln_world + log_p))
+}
+
+/// Format a large or small positive number in a compact, readable way.
+/// For E ≥ 1   : "~{value}x per world"
+/// For E < 1   : "1 in ~{1/E} worlds"
+fn fmt_rarity(ln_e: f64) -> (String, String) {
+    // Thresholds in log-space (all values are ln of the boundary)
+    const LN_1E6:  f64 =  13.815; // ln(1 000 000)
+    const LN_1E3:  f64 =   6.908; // ln(1 000)
+    const LN_10:   f64 =   2.303;
+    const LN_0_01: f64 =  -4.605; // ln(0.01)
+    const LN_1E_6: f64 = -13.816; // ln(1e-6)  ← "essentially unique" boundary
+
+    if ln_e > LN_1E6 {
+        let e = ln_e.exp();
+        ("Extremely common".into(), format!("~{:.2e}x per world", e))
+    } else if ln_e > LN_1E3 {
+        let e = ln_e.exp();
+        ("Very common".into(), format!("~{:.0}x per world", e))
+    } else if ln_e > LN_10 {
+        let e = ln_e.exp();
+        ("Common".into(), format!("~{:.0}x per world", e))
+    } else if ln_e >= 0.0 {
+        let e = ln_e.exp();
+        ("Uncommon".into(), format!("~{:.1}x per world", e))
+    } else if ln_e > LN_0_01 {
+        // E between 0.01 and 1
+        let inv = (-ln_e).exp();
+        ("Rare".into(), format!("1 in ~{:.0} worlds", inv))
+    } else if ln_e > LN_1E_6 {
+        // E between 1e-6 and 0.01
+        let inv = (-ln_e).exp();
+        ("Very rare".into(), format!("1 in ~{:.2e} worlds", inv))
+    } else {
+        // Below one-in-a-million worlds. This does NOT mean the pattern
+        // can't exist — if you typed it in from a real world, it already
+        // does. It means a *second* occurrence of this exact pattern,
+        // anywhere else, is astronomically unlikely.
+        ("ESSENTIALLY".into(), "UNIQUE".into())
+    }
+}
+
 impl Default for App {
     fn default() -> Self {
         let cols = 8usize;
@@ -284,7 +407,7 @@ impl Application for App {
 
     fn title(&self) -> String { String::from("Bedrock Formation Finder") }
 
-    fn theme(&self) -> Theme { Theme::GruvboxDark }
+    fn theme(&self) -> Theme { Theme::custom("Bedrock Dark".to_string(), custom_palette()) }
 
     fn subscription(&self) -> Subscription<Message> {
         let keyboard_sub = event::listen_with(|event, _| {
@@ -461,7 +584,7 @@ impl Application for App {
             Message::Search => {
                 let seed = match self.seed.parse::<i64>() {
                     Ok(s)  => s,
-                    Err(_) => { self.status = SearchStatus::Error("Seed must be a 64-bit integer".into()); return Command::none(); }
+                    Err(_) => { self.status = SearchStatus::Error("Invalid seed. Please set a valid 64-bit integer.".into()); return Command::none(); }
                 };
                 let start_x = match self.center_x.parse::<i32>() {
                     Ok(v)  => v,
@@ -621,7 +744,7 @@ impl Application for App {
         // Scale a fixed pixel value by the current zoom factor.
         let sc = |v: f32| v * s;
 
-        // ── Zoom controls (top-right corner) ───────────────────────────────
+        // Zoom controls (top-right corner)
         let zoom_row = row![
             text(format!("Zoom: {:.0}%", self.ui_scale * 100.0)).size(sc(12.0) as u16),
             Space::with_width(Length::Fixed(sc(6.0))),
@@ -635,7 +758,7 @@ impl Application for App {
                 .padding([sc(3.0) as u16, sc(10.0) as u16]),
         ].spacing(sc(4.0) as u16).align_items(Alignment::Center);
 
-        // ── Section: Search parameters ──────────────────────────────────────
+        // Section: Search parameters
         let seed_row = row![
             text("World Seed").size(sc(14.0) as u16).width(Length::Fixed(sc(120.0))),
             text_input("e.g. 124352345", &self.seed)
@@ -671,65 +794,75 @@ impl Application for App {
                 .text_size(sc(14.0) as u16),
         ].spacing(sc(10.0) as u16).align_items(Alignment::Center);
 
-        // ── Section: Pattern grid ───────────────────────────────────────────
+        // Section: Pattern grid
+        // Laid out as [grid] | [panel] — the grid sits on the left where it
+        // has room to breathe, and every control that configures or acts on
+        // it (size/offset, Y layer, rotate/fill/clear, legend) is gathered
+        // into a single compact panel on the right, instead of trailing
+        // below as a series of full-width rows.
 
-        // Grid size + offset on one compact row, with a visual gap between the
-        // two groups (size vs. offset) instead of just spacing.
-        let grid_controls = row![
-            text("Grid Size").size(sc(13.0) as u16).width(Length::Fixed(sc(68.0))),
-            text("Cols").size(sc(13.0) as u16),
+        // A label column width shared by every row in the side panel, so the
+        // mini-labels ("Size", "Offset", "Y Layer"...) line up like a ruler.
+        let panel_label_w = Length::Fixed(sc(54.0));
+
+        let size_row = row![
+            text("Size").size(sc(12.0) as u16).width(panel_label_w),
+            text("Cols").size(sc(12.0) as u16),
             text_input("8", &self.grid_cols_str)
                 .on_input(Message::GridColsChanged)
-                .size(sc(14.0) as u16)
-                .width(Length::Fixed(sc(46.0)))
-                .padding(sc(6.0) as u16),
-            text("Rows").size(sc(13.0) as u16),
+                .size(sc(13.0) as u16)
+                .width(Length::Fixed(sc(40.0)))
+                .padding(sc(5.0) as u16),
+            text("Rows").size(sc(12.0) as u16),
             text_input("8", &self.grid_rows_str)
                 .on_input(Message::GridRowsChanged)
-                .size(sc(14.0) as u16)
-                .width(Length::Fixed(sc(46.0)))
-                .padding(sc(6.0) as u16),
-            Space::with_width(Length::Fixed(sc(24.0))),
-            text("Offset").size(sc(13.0) as u16).width(Length::Fixed(sc(46.0))),
-            text("X").size(sc(13.0) as u16),
+                .size(sc(13.0) as u16)
+                .width(Length::Fixed(sc(40.0)))
+                .padding(sc(5.0) as u16),
+        ].spacing(sc(6.0) as u16).align_items(Alignment::Center);
+
+        let offset_row = row![
+            text("Offset").size(sc(12.0) as u16).width(panel_label_w),
+            text("X").size(sc(12.0) as u16),
             text_input("0", &self.grid_offset_x)
                 .on_input(Message::GridOffsetXChanged)
-                .size(sc(14.0) as u16)
-                .width(Length::Fixed(sc(58.0)))
-                .padding(sc(6.0) as u16),
-            text("Z").size(sc(13.0) as u16),
+                .size(sc(13.0) as u16)
+                .width(Length::Fixed(sc(48.0)))
+                .padding(sc(5.0) as u16),
+            text("Z").size(sc(12.0) as u16),
             text_input("0", &self.grid_offset_z)
                 .on_input(Message::GridOffsetZChanged)
-                .size(sc(14.0) as u16)
-                .width(Length::Fixed(sc(58.0)))
-                .padding(sc(6.0) as u16),
-        ].spacing(sc(8.0) as u16).align_items(Alignment::Center);
+                .size(sc(13.0) as u16)
+                .width(Length::Fixed(sc(48.0)))
+                .padding(sc(5.0) as u16),
+        ].spacing(sc(6.0) as u16).align_items(Alignment::Center);
 
         // Y-layer tab strip. Tabs marked with * contain at least one non-Unknown cell.
         let ys = y_values(self.bedrock_type);
         let mut y_row: Row<'_, Message> = Row::new()
-            .spacing(sc(6.0) as u16)
+            .spacing(sc(5.0) as u16)
             .align_items(Alignment::Center)
-            .push(text("Y Layer").size(sc(13.0) as u16).width(Length::Fixed(sc(60.0))));
+            .push(text("Y Layer").size(sc(12.0) as u16).width(panel_label_w));
         for (i, &y) in ys.iter().enumerate() {
             let has_data = self.grid_cells[i].iter()
                 .any(|r| r.iter().any(|&c| c != CellState::Unknown));
             let label = if has_data { format!("{}*", y) } else { y.to_string() };
             let btn = if i == self.grid_y_idx {
                 // Active tab: no on_press so clicking it again is a no-op.
-                button(text(label).size(sc(13.0) as u16))
+                button(text(label).size(sc(12.0) as u16))
                     .style(theme::Button::Primary)
-                    .padding([sc(5.0) as u16, sc(14.0) as u16])
+                    .padding([sc(5.0) as u16, sc(10.0) as u16])
             } else {
-                button(text(label).size(sc(13.0) as u16))
+                button(text(label).size(sc(12.0) as u16))
                     .style(theme::Button::Secondary)
                     .on_press(Message::GridYChanged(i))
-                    .padding([sc(5.0) as u16, sc(14.0) as u16])
+                    .padding([sc(5.0) as u16, sc(10.0) as u16])
             };
             y_row = y_row.push(btn);
         }
 
-        // Cell grid
+        // Cell grid — the visual centerpiece, kept on the left with nothing
+        // crowding it.
         let mut grid_col: Column<'_, Message> = Column::new().spacing(sc(3.0) as u16);
         for row_idx in 0..self.grid_rows {
             let mut grid_row: Row<'_, Message> = Row::new().spacing(sc(3.0) as u16);
@@ -737,8 +870,8 @@ impl Application for App {
                 let state = self.grid_cells[self.grid_y_idx][row_idx][col_idx];
                 let (label, style) = match state {
                     CellState::Unknown    => ("?", theme::Button::Secondary),
-                    CellState::NonBedrock => ("O", theme::Button::Primary),
-                    CellState::Bedrock    => ("X", theme::Button::Destructive),
+                    CellState::NonBedrock => ("O", theme::Button::Destructive),
+                    CellState::Bedrock    => ("X", theme::Button::Primary),
                 };
                 let cell = mouse_area(
                     button(
@@ -759,44 +892,105 @@ impl Application for App {
             grid_col = grid_col.push(grid_row);
         }
 
-        // Grid toolbar: rotate buttons on the left, action buttons on the right.
-        // Consolidating what were two separate rows into one saves vertical space
-        // and groups related controls more logically.
-        let grid_toolbar = row![
-            text("Rotate:").size(sc(12.0) as u16).width(Length::Fixed(sc(54.0))),
-            button(text("+90\u{00b0} CW").size(sc(12.0) as u16))
+        let rotate_row = row![
+            text("Rotate").size(sc(12.0) as u16).width(panel_label_w),
+            button(text("+90º").size(sc(12.0) as u16))
                 .on_press(Message::RotateCW)
                 .style(theme::Button::Secondary)
                 .padding([sc(4.0) as u16, sc(10.0) as u16]),
-            button(text("\u{2212}90\u{00b0} CCW").size(sc(12.0) as u16))
+            button(text("-90º").size(sc(12.0) as u16))
                 .on_press(Message::RotateCCW)
                 .style(theme::Button::Secondary)
                 .padding([sc(4.0) as u16, sc(10.0) as u16]),
-            Space::with_width(Length::Fill),
-            button(text("Fill ? \u{2192} O").size(sc(12.0) as u16))
+        ].spacing(sc(6.0) as u16).align_items(Alignment::Center);
+
+        let edit_row = row![
+            text("Edit").size(sc(12.0) as u16).width(panel_label_w),
+            button(text("? -> O").size(sc(12.0) as u16))
                 .on_press(Message::FillUnknownNonBedrockLayer)
                 .style(theme::Button::Secondary)
                 .padding([sc(4.0) as u16, sc(10.0) as u16]),
-            button(text("Clear all").size(sc(12.0) as u16))
+            button(text("O/X -> ?").size(sc(12.0) as u16))
                 .on_press(Message::ClearGrid)
                 .style(theme::Button::Secondary)
                 .padding([sc(4.0) as u16, sc(10.0) as u16]),
-        ].spacing(sc(8.0) as u16).align_items(Alignment::Center);
+        ].spacing(sc(6.0) as u16).align_items(Alignment::Center);
 
-        // Legend: just the visual key. Actions moved to grid_toolbar above.
-        let legend = row![
-            text("Click:").size(sc(11.0) as u16),
-            Space::with_width(Length::Fixed(sc(6.0))),
-            text("?  Unknown").size(sc(11.0) as u16),
-            Space::with_width(Length::Fixed(sc(14.0))),
-            text("O  Non-bedrock").size(sc(11.0) as u16),
-            Space::with_width(Length::Fixed(sc(14.0))),
-            text("X  Bedrock").size(sc(11.0) as u16),
-            Space::with_width(Length::Fixed(sc(18.0))),
-            text("(right-click reverses)").size(sc(11.0) as u16),
-        ].align_items(Alignment::Center);
+        // Legend, stacked vertically rather than strung out horizontally —
+        // reads naturally as a short key in a narrow side panel.
+        let legend = Column::new()
+            .spacing(sc(3.0) as u16)
+            .push(text("Legend").size(sc(12.0) as u16))
+            .push(Space::with_height(Length::Fixed(sc(6.0))))
+            .push(text("?   Unknown").size(sc(11.0) as u16))
+            .push(text("O  Non-bedrock").size(sc(11.0) as u16))
+            .push(text("X   Bedrock").size(sc(11.0) as u16))
+            .push(Space::with_height(Length::Fixed(sc(6.0))))
+            .push(text("Right-click to reverse").size(sc(11.0) as u16));
 
-        // ── Section: Search options ─────────────────────────────────────────
+        // Pattern rarity panel — shown to the right of the legend. Updates
+        // in real time as the user fills cells, using only the cells that are
+        // actually set (not the grid dimensions), so a 2x8 pattern and a 4x4
+        // pattern with the same number of constrained cells show the same odds.
+        let hsz = sc(12.0) as u16; // header size, matches the "Legend" header
+        let rsz = sc(11.0) as u16; // same font size as the legend entries
+        let mut rarity_col: Column<'_, Message> = Column::new()
+            .spacing(sc(3.0) as u16)
+            .push(text("Pattern rarity").size(hsz))
+            .push(text("To avoid duplicates,").size(rsz))
+            .push(text("keep odds below 'Common'.").size(rsz));
+
+        match pattern_occurrence_stats(&self.grid_cells, self.bedrock_type) {
+            None => {
+                // No cells filled yet — gently prompt the user.
+                rarity_col = rarity_col
+                    .push(text("(Fill grid cells").size(rsz))
+                    .push(text("to see odds)").size(rsz));
+            }
+            Some((_n, ln_e)) => {
+                let (label, detail) = fmt_rarity(ln_e);
+                rarity_col = rarity_col
+                    .push(text(label).size(rsz))
+                    .push(text(detail).size(rsz));
+
+                // When E is below one-in-a-million, a *second* occurrence of
+                // this exact pattern anywhere else is essentially impossible.
+                // This doesn't mean the pattern itself can't exist — if it
+                // came from a real world, it already does, once.
+                if ln_e <= -13.816 {
+                    rarity_col = rarity_col
+                        .push(text("No duplicate of this").size(rsz))
+                        .push(text("will ever be found.").size(rsz));
+                }
+            }
+        }
+
+        // Legend and rarity side by side, top-aligned.
+        let legend_and_rarity: Row<'_, Message> = Row::new()
+            .spacing(sc(20.0) as u16)
+            .align_items(Alignment::Start)
+            .push(legend)
+            .push(rarity_col);
+
+        // The full right-hand panel: everything that configures or acts on
+        // the grid, grouped into clearly separated sub-blocks.
+        let grid_panel: Column<'_, Message> = Column::new()
+            .spacing(sc(16.0) as u16)
+            .width(Length::Shrink)
+            .push(Column::new().spacing(sc(6.0) as u16).push(size_row).push(offset_row))
+            .push(y_row)
+            .push(Column::new().spacing(sc(6.0) as u16).push(rotate_row).push(edit_row))
+            .push(legend_and_rarity);
+
+        // Grid + panel side by side, top-aligned so the panel starts level
+        // with the first row of cells.
+        let grid_section: Row<'_, Message> = Row::new()
+            .spacing(sc(28.0) as u16)
+            .align_items(Alignment::Start)
+            .push(grid_col)
+            .push(grid_panel);
+
+        // Section: Search options
         let all_rotations_row = row![
             checkbox(
                 "Search all 4 rotations  (north direction unknown)",
@@ -817,7 +1011,7 @@ impl Application for App {
                 .text_size(sc(13.0) as u16),
         ].align_items(Alignment::Center);
 
-        // ── Search / Cancel buttons ─────────────────────────────────────────
+        // Search / Cancel buttons
         // Search gets Primary style so it stands out; Cancel gets Destructive
         // only while a search is actually running (communicates urgency).
         let search_btn = if is_searching {
@@ -840,7 +1034,7 @@ impl Application for App {
                 .padding([sc(10.0) as u16, sc(22.0) as u16])
         };
 
-        // ── Status bar ──────────────────────────────────────────────────────
+        // Status bar
         let status_msg = match &self.status {
             SearchStatus::Idle              => text("Ready.").size(sc(15.0) as u16),
             SearchStatus::Searching(area)   => text(format!("Searching {}\u{2026}", area)).size(sc(15.0) as u16),
@@ -849,7 +1043,7 @@ impl Application for App {
             SearchStatus::Error(e)          => text(format!("Error: {}", e)).size(sc(15.0) as u16),
         };
 
-        // ── Layout assembly ─────────────────────────────────────────────────
+        // Layout assembly
         let content = Column::new()
             .spacing(0)
             .padding(sc(18.0) as u16)
@@ -858,7 +1052,7 @@ impl Application for App {
             // Title bar
             .push(
                 row![
-                    text("Bedrock Formation Finder").size(sc(24.0) as u16),
+                    text("Minecraft Bedrock Finder").size(sc(24.0) as u16),
                     Space::with_width(Length::Fill),
                     zoom_row,
                 ].align_items(Alignment::Center)
@@ -877,17 +1071,9 @@ impl Application for App {
             .push(horizontal_rule(1))
             .push(Space::with_height(Length::Fixed(sc(12.0))))
 
-            // Pattern grid
-            .push(grid_controls)
-            .push(Space::with_height(Length::Fixed(sc(10.0))))
-            .push(y_row)
-            .push(Space::with_height(Length::Fixed(sc(6.0))))
-            .push(grid_col)
-            .push(Space::with_height(Length::Fixed(sc(8.0))))
-            .push(grid_toolbar)
-            .push(Space::with_height(Length::Fixed(sc(6.0))))
-            .push(legend)
-            .push(Space::with_height(Length::Fixed(sc(14.0))))
+            // Pattern grid (grid on the left, all grid controls on the right)
+            .push(grid_section)
+            .push(Space::with_height(Length::Fixed(sc(16.0))))
             .push(horizontal_rule(1))
             .push(Space::with_height(Length::Fixed(sc(12.0))))
 

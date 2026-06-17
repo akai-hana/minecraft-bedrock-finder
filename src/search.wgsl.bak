@@ -104,29 +104,19 @@ fn spiral_pos(k: U64, sx: i32, sz: i32) -> vec2<i32> {
     // Correct l so that 4l^2-4l+1 <= k <= 4l^2+4l, placing k in shell l.
     // f32 imprecision is tiny relative to l even near u64::MAX, so this
     // converges in at most a few iterations; 64 is a generous safety bound.
-    //
-    // l^2 is tracked incrementally instead of being recomputed from scratch
-    // every iteration: (l+1)^2 = l^2 + 2l + 1 and (l-1)^2 = l^2 - 2l + 1 are
-    // each one U64 shift-and-add, versus `u64_mul`'s six 32x32 sub-multiplies.
-    // Only the *initial* square below costs a real multiply - matching the
-    // original cost for the overwhelmingly common case where the f32 estimate
-    // is already exact and the loop breaks on iteration 0.
-    var lsq: U64 = u64_mul(u32_to_u64(l), u32_to_u64(l));
-
     var four_l: U64;
     var lower:  U64; // 4l^2 - 4l + 1
     for (var iter = 0u; iter < 64u; iter = iter + 1u) {
-        let l64      = u32_to_u64(l);
-        let four_lsq = u64_double(u64_double(lsq));   // 4l^2 (no multiply)
+        let l64     = u32_to_u64(l);
+        let lsq     = u64_mul(l64, l64);
+        let four_lsq = u64_double(u64_double(lsq));   // 4l^2
         four_l       = u64_double(u64_double(l64));   // 4l
         let upper    = u64_add(four_lsq, four_l);                       // 4l^2 + 4l
         lower        = u64_add(u64_sub(four_lsq, four_l), U64(1u, 0u)); // 4l^2 - 4l + 1
 
         if (u64_lt(upper, k)) {
-            lsq = u64_add(lsq, u64_add(u64_double(l64), U64(1u, 0u))); // + (2l+1)
             l += 1u;
         } else if (u64_lt(k, lower)) {
-            lsq = u64_sub(lsq, u64_sub(u64_double(l64), U64(1u, 0u))); // - (2l-1)
             l -= 1u;
         } else {
             break;
@@ -155,27 +145,27 @@ fn spiral_pos(k: U64, sx: i32, sz: i32) -> vec2<i32> {
     return vec2<i32>(sx + ox, sz + oz);
 }
 
-// math_hash_terms
+// math_hash
 //
-// Takes the already-combined 64-bit `term_x`/`term_z` hash terms rather than
-// raw coordinates. The caller is responsible for computing:
+// The CPU computes z_term as:
+//   (oz as i64).wrapping_mul(K).wrapping_add((bz as i64).wrapping_mul(K))
+// i.e. it sign-extends oz and bz to 64 bits *individually*, multiplies each by
+// K = 116_129_781 in full 64-bit width, then adds.  It never sums oz+bz in i32
+// first.  If we summed (oz+bz) as i32 and then sign-extended, the result would
+// be wrong whenever oz+bz overflows i32 - a silent mismatch for world
+// coordinates near +/-2^31.
 //
-//   term_x = i32_to_u64( (ox * 3_129_871) [wrapping i32] + b.bx_k )
-//   term_z = u64_add( oz_term, U64(b.bz_k_lo, b.bz_k_hi) )
-//
-// where `b.bx_k`/`b.bz_k_lo/hi` are the block's own coordinate pre-multiplied
-// by the same constants on the CPU, and `oz_term = i32_to_u64(oz) * K` is the
-// thread's own z-multiply, computed once per thread (see `main`). Because
-// wrapping 32-bit multiplication distributes over addition
-// ((ox+bx)*K == ox*K + bx*K mod 2^32), and 64-bit multiplication distributes
-// over addition exactly, splitting the multiply this way and pushing the
-// `ox`/`oz`-dependent half out of the per-block loop is mathematically
-// identical to the original "multiply the sum every block" approach, just
-// far cheaper: an O(1) multiply per thread instead of an O(blocks) one. This
-// exactly mirrors the CPU's `check_formation_with_terms` / `bx_hash_term` /
-// `bz_hash_term` split in core.rs.
-fn math_hash_terms(term_x: U64, term_z: U64, y: i32) -> U64 {
-    var l       = u64_xor(u64_xor(term_x, term_z), i32_to_u64(y));
+// oz and bz are taken as separate parameters so each is sign-extended to
+// U64 before multiplication, and the call site passes them individually.
+
+fn math_hash(x: i32, y: i32, oz: i32, bz: i32) -> U64 {
+    let K       = U64(116129781u, 0u);
+    let x_term  = i32_to_u64(x * 3129871);
+    // Sign-extend oz and bz to 64 bits first, multiply each by K, then add.
+    // This mirrors: (oz as i64)*K + (bz as i64)*K  (never wrapping at 32 bits).
+    let z_term  = u64_add(u64_mul(i32_to_u64(oz), K),
+                           u64_mul(i32_to_u64(bz), K));
+    var l       = u64_xor(u64_xor(x_term, z_term), i32_to_u64(y));
     let inner   = u64_add(u64_mul(l, U64(42317861u, 0u)), U64(11u, 0u));
     l           = u64_mul(l, inner);
     return i64_sra16(l);
@@ -216,18 +206,15 @@ struct SearchUniforms {
     batch_base_k_hi:     u32,
 }
 
-// Must match `GpuBlock` in gpu.rs (32 bytes).
 struct BlockData {
-    // Precomputed (bx as u32).wrapping_mul(3_129_871) - see math_hash_terms.
-    bx_k:              u32,
+    bx:                i32,
     by:                i32,
-    // Precomputed (bz as i64).wrapping_mul(116_129_781), low/high 32 bits.
-    bz_k_lo:           u32,
-    bz_k_hi:           u32,
+    bz:                i32,
     prob_threshold:    u32,
     should_be_bedrock: u32,
     pad0:              u32,
     pad1:              u32,
+    pad2:              u32,
 }
 
 @group(0) @binding(0) var<uniform>             uniforms: SearchUniforms;
@@ -255,15 +242,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dlo = U64(uniforms.dlo_lo, uniforms.dlo_hi);
     let dhi = U64(uniforms.dhi_lo, uniforms.dhi_hi);
 
-    // Hoisted per-thread hash terms. These depend only on this thread's
-    // (ox, oz) position, so computing them once here - instead of once per
-    // block, as the naive version would - turns what was up to
-    // rotation_count * blocks_per_rotation 64-bit multiplies per thread into
-    // a single 32-bit and a single 64-bit multiply, with only a cheap U64 add
-    // remaining inside the block loop. See math_hash_terms for the algebra.
-    let ox_k    = bitcast<u32>(ox) * 3129871u;
-    let oz_term = u64_mul(i32_to_u64(oz), U64(116129781u, 0u));
-
     var any_rotation_passes = false;
     for (var r = 0u; r < uniforms.rotation_count; r++) {
         if (any_rotation_passes) { break; }
@@ -272,12 +250,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var i = 0u; i < uniforms.blocks_per_rotation; i++) {
             if (!rot_passes) { break; }
             let b          = blocks[base + i];
-            // term_x/term_z combine this thread's hoisted terms with the
-            // block's precomputed bx_k/bz_k via cheap adds only - see
-            // math_hash_terms for why this is exact, not approximate.
-            let term_x     = i32_to_u64(bitcast<i32>(ox_k + b.bx_k));
-            let term_z     = u64_add(oz_term, U64(b.bz_k_lo, b.bz_k_hi));
-            let hash       = math_hash_terms(term_x, term_z, b.by);
+            // Pass ox+b.bx as a single i32 (safe: x_term uses 32-bit modular
+            // multiply which distributes over addition, so overflow is harmless).
+            // Pass oz and b.bz *separately* so math_hash can sign-extend each to
+            // 64 bits before multiplying - matching the CPU's wrapping_mul order.
+            let hash       = math_hash(ox + b.bx, b.by, oz, b.bz);
             let s0         = u64_xor(hash, dlo);
             let res        = xoroshiro_step(s0, dhi);
             let top24      = u64_shr40(res);
