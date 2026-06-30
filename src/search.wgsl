@@ -1,8 +1,27 @@
-// search.wgsl - bedrock formation GPU kernel
+// Bedrock formation GPU kernel
 //
 // Each thread independently computes its spiral position from its global
 // thread index, so no candidate position buffer needs to be uploaded.
 // 64-bit arithmetic is emulated with U64 (lo, hi) pairs throughout.
+
+// Workgroup size
+// Overridable via PipelineCompilationOptions (wgpu >= 0.20).
+// To benchmark different sizes, change GPU_WORKGROUP_SIZE in gpu.rs; this
+// constant is set at pipeline-creation time to match it.  The GPU dispatch
+// calculations in search_batch() use the same constant on the Rust side.
+// Candidate values to benchmark on your target hardware: 64, 128, 256, 512.
+// The U64 emulation raises per-thread register usage relative to a native-i64
+// kernel, which can cap occupancy at the driver level; smaller sizes may
+// improve occupancy on register-pressure-sensitive GPUs (typically AMD), while
+// larger sizes may improve IPC on warp-wide execution hardware (NVIDIA).
+//
+// This is a plain `const`, not a pipeline-overridable `override`: the naga
+// WGSL frontend bundled with wgpu 0.19 (the version this project is pinned
+// to) doesn't parse `override` declarations at all. That means the value
+// can't be supplied at pipeline-creation time from gpu.rs; it must be
+// edited here directly, and `GPU_WORKGROUP_SIZE` in gpu.rs must be kept in
+// sync with whatever you set it to.
+const WORKGROUP_SIZE_X: u32 = 256u;
 
 // U64 helpers
 
@@ -43,6 +62,15 @@ fn u64_mul(a: U64, b: U64) -> U64 {
     return U64(ll.lo, ll.hi + cross);
 }
 
+// Low 64 bits of a * b where b fits in u32 (b.hi is always 0).
+// Saves one u32 multiply in the cross-product vs the general u64_mul:
+// the `a.lo * b.hi` term vanishes, leaving only `a.hi * b` for the high word.
+fn u64_mul_u32(a: U64, b: u32) -> U64 {
+    let ll    = mul32x32(a.lo, b);
+    let cross = a.hi * b;   // a.lo * b.hi term vanishes because b.hi == 0
+    return U64(ll.lo, ll.hi + cross);
+}
+
 // a - b, assuming a >= b (no underflow check - callers guarantee this).
 fn u64_sub(a: U64, b: U64) -> U64 {
     let borrow = select(0u, 1u, a.lo < b.lo);
@@ -72,74 +100,94 @@ fn i32_to_u64(v: i32) -> U64 {
     return U64(u32(v), select(0u, 0xFFFFFFFFu, v < 0));
 }
 
-// Spiral position (closed form)
+// Spiral position helpers
 //
-// Mirrors the Rust `coords_from_lj(l, j)` exactly:
-//   Shell l, intra-shell offset j = k - (4l^2-4l+1)
-//   j < 2l-1              -> Leg 0 Up   (+z): (l,  -(l-1)+j)
-//   2l-1 <= j < 4l-1       -> Leg 1 Left (-x): (l-o,  l)       o = j-(2l-1)
-//   4l-1 <= j < 6l-1       -> Leg 2 Down (-z): (-l,   l-o)     o = j-(4l-1)
-//   j >= 6l-1              -> Leg 3 Right(+x): (-l+o, -l)      o = j-(6l-1)
+// The original monolithic `spiral_pos` is split into three functions so that
+// the expensive shell-finding step (f32 sqrt + correction loop) can be amortised
+// across an entire workgroup via shared memory (Section 1 of the optimisation
+// plan). The three pieces are:
 //
-// `k` is a full U64 (lo/hi u32 pair, mirroring the CPU's i64). All
-// shell-boundary arithmetic (4l^2 +/- 4l, comparisons against k) is done with
-// exact U64 add/sub/compare - there is no i32(k) cast and therefore no
-// ~2.1-billion ceiling. The only inexact step is the *initial* shell
-// estimate via f32::sqrt, which the loop below corrects to the exact
-// value, so the final result is exact for any k.
+//   find_shell   - the sqrt estimate and U64 correction loop; returns the
+//                  shell index l, its lower/upper k-range boundaries, and 4*l.
+//   leg_from_lj  - the four-leg position dispatch; pure integer arithmetic,
+//                  takes (l, j, four_l) and returns the unshifted (ox, oz) offset.
+//   spiral_pos_slow - the full reference path: k==0 shortcut, then find_shell +
+//                  leg_from_lj + centre shift. Bit-for-bit identical to the
+//                  previous monolithic `spiral_pos`. Used as the slow-path
+//                  fallback for workgroups that straddle a shell boundary.
 //
-// `l` stays a u32 and the final `ox`/`oz` offsets are cast to i32, giving
-// the same bound as the CPU path (l <= i32::MAX, unreachable in practice
-// since `4*l*l` overflows i64 long before that).
+// The shell spiral coordinate system (mirrors Rust `coords_from_lj`):
+//   Shell l, intra-shell offset j = k - (4l^2 - 4l + 1)
+//   j < 2l-1              -> Leg 0 Up    (+z): (l,    -(l-1)+j)
+//   2l-1 <= j < 4l-1      -> Leg 1 Left  (-x): (l-o,  l)         o = j-(2l-1)
+//   4l-1 <= j < 6l-1      -> Leg 2 Down  (-z): (-l,   l-o)       o = j-(4l-1)
+//   j >= 6l-1             -> Leg 3 Right (+x): (-l+o, -l)        o = j-(6l-1)
+//
+// `k` is a full U64 (lo/hi u32 pair). All shell-boundary arithmetic is done
+// with exact U64 add/sub/compare; no i32(k) cast, no ~2.1-billion ceiling.
+// The only inexact step is the initial f32 sqrt estimate, corrected by the
+// loop. `l` stays a u32; final (ox, oz) are cast to i32 (l <= i32::MAX is
+// unreachable in practice before 4*l*l overflows i64).
 
-fn spiral_pos(k: U64, sx: i32, sz: i32) -> vec2<i32> {
-    if (k.lo == 0u && k.hi == 0u) { return vec2<i32>(sx, sz); }
+// Return type for find_shell.
+struct ShellInfo {
+    l:      u32,
+    lower:  U64,   // 4l^2 - 4l + 1  (inclusive lower bound of shell l)
+    upper:  U64,   // 4l^2 + 4l      (inclusive upper bound of shell l)
+    four_l: U64,   // 4 * l          (cached for leg_from_lj)
+}
 
-    // Initial shell estimate. f32 has 24 bits of mantissa, so for very
-    // large k this can be off by more than 1 - the loop below corrects it
-    // to the exact value using U64 arithmetic.
+// find_shell: locate the shell that contains k and return its boundary info.
+//
+// Precondition: k != 0.  The k == 0 origin does not belong to any shell;
+// callers must handle it as a special case before invoking this function.
+//
+// The f32 sqrt estimate is cheap but can be off by a small amount for very
+// large k (f32 has 24 mantissa bits); the correction loop adjusts l by ±1
+// each iteration until 4l^2-4l+1 <= k <= 4l^2+4l. l^2 is tracked
+// incrementally; (l+1)^2 = l^2 + 2l + 1; to avoid a full u64_mul each
+// iteration.  The loop breaks on the first iteration in the overwhelmingly
+// common case where the f32 estimate is already exact; 64 iterations is a
+// generous safety bound.
+fn find_shell(k: U64) -> ShellInfo {
     let kf = f32(k.hi) * 4294967296.0 + f32(k.lo);
-    var l: u32 = max(1u, u32((1.0 + sqrt(kf)) * 0.5));
-
-    // Correct l so that 4l^2-4l+1 <= k <= 4l^2+4l, placing k in shell l.
-    // f32 imprecision is tiny relative to l even near u64::MAX, so this
-    // converges in at most a few iterations; 64 is a generous safety bound.
-    //
-    // l^2 is tracked incrementally instead of being recomputed from scratch
-    // every iteration: (l+1)^2 = l^2 + 2l + 1 and (l-1)^2 = l^2 - 2l + 1 are
-    // each one U64 shift-and-add, versus `u64_mul`'s six 32x32 sub-multiplies.
-    // Only the *initial* square below costs a real multiply - matching the
-    // original cost for the overwhelmingly common case where the f32 estimate
-    // is already exact and the loop breaks on iteration 0.
+    var l: u32  = max(1u, u32((1.0 + sqrt(kf)) * 0.5));
     var lsq: U64 = u64_mul(u32_to_u64(l), u32_to_u64(l));
 
     var four_l: U64;
-    var lower:  U64; // 4l^2 - 4l + 1
+    var lower:  U64;
+    var upper:  U64;
     for (var iter = 0u; iter < 64u; iter = iter + 1u) {
         let l64      = u32_to_u64(l);
         let four_lsq = u64_double(u64_double(lsq));   // 4l^2 (no multiply)
         four_l       = u64_double(u64_double(l64));   // 4l
-        let upper    = u64_add(four_lsq, four_l);                       // 4l^2 + 4l
+        upper        = u64_add(four_lsq, four_l);                       // 4l^2 + 4l
         lower        = u64_add(u64_sub(four_lsq, four_l), U64(1u, 0u)); // 4l^2 - 4l + 1
 
         if (u64_lt(upper, k)) {
-            lsq = u64_add(lsq, u64_add(u64_double(l64), U64(1u, 0u))); // + (2l+1)
-            l += 1u;
+            lsq = u64_add(lsq, u64_add(u64_double(l64), U64(1u, 0u))); // l^2 += 2l+1
+            l  += 1u;
         } else if (u64_lt(k, lower)) {
-            lsq = u64_sub(lsq, u64_sub(u64_double(l64), U64(1u, 0u))); // - (2l-1)
-            l -= 1u;
+            lsq = u64_sub(lsq, u64_sub(u64_double(l64), U64(1u, 0u))); // l^2 -= 2l-1
+            l  -= 1u;
         } else {
             break;
         }
     }
+    return ShellInfo(l, lower, upper, four_l);
+}
 
-    // j = k - (4l^2 - 4l + 1). Fits in u32: j <= 8l-2 and l <= i32::MAX
-    // implies j < u32::MAX.
-    let j = u64_sub(k, lower).lo;
-
-    let b0 = u64_sub(u64_double(u32_to_u64(l)), U64(1u, 0u)).lo;                  // 2l - 1
-    let b1 = u64_sub(four_l, U64(1u, 0u)).lo;                                     // 4l - 1
-    let b2 = u64_sub(u64_add(four_l, u64_double(u32_to_u64(l))), U64(1u, 0u)).lo; // 6l - 1
+// leg_from_lj: given shell index l, intra-shell offset j = k - lower, and
+// 4*l (pre-computed by find_shell), return the (ox, oz) position offset
+// relative to the spiral centre. Does NOT add the centre coordinates
+// callers do that so the shift can be folded with other arithmetic.
+//
+// j must fit in u32: j <= 8l-2 and l <= i32::MAX guarantees j < u32::MAX.
+fn leg_from_lj(l: u32, j: u32, four_l: U64) -> vec2<i32> {
+    let l2 = u32_to_u64(l);
+    let b0 = u64_sub(u64_double(l2), U64(1u, 0u)).lo;                  // 2l - 1
+    let b1 = u64_sub(four_l,         U64(1u, 0u)).lo;                  // 4l - 1
+    let b2 = u64_sub(u64_add(four_l, u64_double(l2)), U64(1u, 0u)).lo; // 6l - 1
 
     let li = i32(l);
     var ox: i32; var oz: i32;
@@ -152,8 +200,41 @@ fn spiral_pos(k: U64, sx: i32, sz: i32) -> vec2<i32> {
     } else {
         let o = i32(j - b2); ox = -li + o;  oz = -li;
     }
-    return vec2<i32>(sx + ox, sz + oz);
+    return vec2<i32>(ox, oz);
 }
+
+// spiral_pos_slow: full reference implementation, behaviourally identical to
+// the previous monolithic `spiral_pos`. Used on the slow path for workgroups
+// that straddle a shell boundary and for the k==0 origin.
+//
+// Keeping this function unconditionally present and reachable means the fast
+// path (below) can be disabled for rollback or A/B testing by replacing the
+// fast/slow dispatch in `main` with a single `spiral_pos_slow` call, without
+// reverting the refactor.
+fn spiral_pos_slow(k: U64, sx: i32, sz: i32) -> vec2<i32> {
+    if (k.lo == 0u && k.hi == 0u) { return vec2<i32>(sx, sz); }
+    let s   = find_shell(k);
+    let j   = u64_sub(k, s.lower).lo;
+    let off = leg_from_lj(s.l, j, s.four_l);
+    return vec2<i32>(sx + off.x, sz + off.y);
+}
+
+// Workgroup-shared anchor
+//
+// For any reasonably large spiral radius the shell length (8*l) is much larger
+// than a 256-thread workgroup, so all threads in a workgroup almost always
+// fall inside the same shell l. Only thread 0 (local_invocation_index == 0)
+// needs to run the expensive find_shell; every other thread derives its
+// intra-shell offset j with a single U64 subtraction and reads the leg
+// boundaries from these shared variables.
+//
+// The four shared variables hold the anchor shell state written by thread 0 and
+// read by all threads after workgroupBarrier(). They are only valid after the
+// barrier; reading them before the barrier is a data race.
+var<workgroup> wg_l:      u32;
+var<workgroup> wg_lower:  U64;
+var<workgroup> wg_upper:  U64;
+var<workgroup> wg_four_l: U64;
 
 // math_hash_terms
 //
@@ -176,7 +257,7 @@ fn spiral_pos(k: U64, sx: i32, sz: i32) -> vec2<i32> {
 // `bz_hash_term` split in core.rs.
 fn math_hash_terms(term_x: U64, term_z: U64, y: i32) -> U64 {
     var l       = u64_xor(u64_xor(term_x, term_z), i32_to_u64(y));
-    let inner   = u64_add(u64_mul(l, U64(42317861u, 0u)), U64(11u, 0u));
+    let inner   = u64_add(u64_mul_u32(l, 42317861u), U64(11u, 0u));
     l           = u64_mul(l, inner);
     return i64_sra16(l);
 }
@@ -190,6 +271,11 @@ fn xoroshiro_step(s0: U64, s1: U64) -> U64 {
 fn u64_shr40(a: U64) -> u32 { return a.hi >> 8u; }
 
 // Bindings
+//
+// NOTE: when push constants are enabled in gpu.rs, the Rust side replaces the
+// `@group(0) @binding(0) var<uniform>` declaration below with
+// `var<push_constant>` at pipeline-creation time (runtime string patch).
+// The blocks and result bindings are unaffected and stay as storage buffers.
 
 struct SearchUniforms {
     dlo_lo:              u32,
@@ -203,8 +289,8 @@ struct SearchUniforms {
     batch_base_k_lo:     u32,   // absolute spiral index of this batch's first candidate (low 32 bits)
     start_x:             i32,   // spiral centre
     start_z:             i32,
-    // Width (in threads) of one dispatch "row" = workgroups_x * 256. Combined
-    // with @builtin(global_invocation_id) this reconstructs a linear
+    // Width (in threads) of one dispatch "row" = workgroups_x * WORKGROUP_SIZE_X.
+    // Combined with @builtin(global_invocation_id) this reconstructs a linear
     // candidate index even when the dispatch grid is 2-D (see gpu.rs).
     dispatch_width:      u32,
     // Number of rotations stored back-to-back in the block buffer.
@@ -212,7 +298,7 @@ struct SearchUniforms {
     rotation_count:      u32,
     // High 32 bits of the absolute spiral index of this batch's first
     // candidate (was unused `_pad2`). Together with `batch_base_k_lo` this
-    // forms a full 64-bit spiral index k - see spiral_pos.
+    // forms a full 64-bit spiral index k - see spiral_pos_slow.
     batch_base_k_hi:     u32,
 }
 
@@ -236,21 +322,112 @@ struct BlockData {
 
 // Kernel
 
-@compute @workgroup_size(256, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+@compute @workgroup_size(WORKGROUP_SIZE_X, 1, 1)
+fn main(
+    @builtin(global_invocation_id)   gid: vec3<u32>,
+    @builtin(local_invocation_index) li:  u32,
+) {
     // The dispatch grid may be 2-D (see gpu.rs for why), so reconstruct a
     // single linear candidate index from (gid.x, gid.y).
     let tid = gid.y * uniforms.dispatch_width + gid.x;
+
+    // k = batch_base_k + tid as a full U64. Computed before the early-return
+    // guard so that thread 0 can write the workgroup anchor unconditionally
+    // the barrier below must be reached by ALL invocations in the workgroup,
+    // including trailing threads in the last workgroup whose tid >= candidate_count.
+    let batch_base_k = U64(uniforms.batch_base_k_lo, uniforms.batch_base_k_hi);
+    let k = u64_add(batch_base_k, u32_to_u64(tid));
+
+    // Workgroup-shared spiral anchor
+    //
+    // Thread 0 (li == 0) calls find_shell for its own k and writes the four
+    // shared anchor variables. Every other thread reads them after the barrier
+    // and uses them to compute its own intra-shell offset j with a single
+    // U64 subtraction, skipping the sqrt and the correction loop entirely.
+    //
+    // Why the anchor key invariant holds (k >= wg_lower for all threads):
+    //   Thread 0 holds the smallest k in the workgroup (tid values are
+    //   contiguous within a workgroup and increase with li, so k0 <= k_i for
+    //   all i > 0). find_shell guarantees k0 >= wg_lower for the shell it
+    //   places k0 in. Therefore k_i >= k0 >= wg_lower for all i > 0.
+    //   The lower-bound check can be skipped; only the upper bound is uncertain.
+    //
+    // k == 0 sentinel (k0 == 0, the very first candidate of the search):
+    //   find_shell is undefined for k == 0 (no shell contains the origin).
+    //   Thread 0 instead writes a sentinel with wg_upper == wg_lower == 0.
+    //   For any thread with k > 0: u64_lt(wg_upper=0, k>0) is true, so the
+    //   fast-path condition `!u64_lt(wg_upper, k)` is false: all threads
+    //   fall through to spiral_pos_slow, which handles k == 0 internally.
+    //   Thread 0 itself (k == 0) is caught by the explicit k == 0 guard in
+    //   the position dispatch below before any u64_sub is attempted.
+    if (li == 0u) {
+        if (k.lo == 0u && k.hi == 0u) {
+            // Sentinel: forces every thread in this workgroup to slow path.
+            wg_l      = 0u;
+            wg_lower  = U64(0u, 0u);
+            wg_upper  = U64(0u, 0u);
+            wg_four_l = U64(0u, 0u);
+        } else {
+            let s     = find_shell(k);
+            wg_l      = s.l;
+            wg_lower  = s.lower;
+            wg_upper  = s.upper;
+            wg_four_l = s.four_l;
+        }
+    }
+
+    // Synchronise: all threads must wait here before reading the wg_* variables.
+    //
+    // The barrier is placed BEFORE the candidate_count early-return, not after,
+    // because WGSL requires every invocation in a workgroup to execute the same
+    // barrier calls in the same order. In the last dispatch workgroup some
+    // threads may have tid >= candidate_count; they must still participate in
+    // the barrier and only return afterwards. If thread 0's tid >= candidate_count
+    // then ALL threads in the workgroup are out of bounds (thread 0 has the
+    // smallest tid), so the barrier is correctly reached by all, then all return.
+    workgroupBarrier();
+
+    // Out-of-bounds guard; placed after the barrier (see note above).
     if (tid >= uniforms.candidate_count) { return; }
 
-    // Compute this thread's spiral position - no buffer read needed.
-    // k = batch_base_k + tid, computed as a full U64 so spiral_pos has no
-    // ~2.1-billion ceiling (see spiral_pos for details).
-    let batch_base_k = U64(uniforms.batch_base_k_lo, uniforms.batch_base_k_hi);
-    let k   = u64_add(batch_base_k, u32_to_u64(tid));
-    let pos = spiral_pos(k, uniforms.start_x, uniforms.start_z);
-    let ox  = pos.x;
-    let oz  = pos.y;
+    // Spiral position dispatch
+    //
+    // Fast path: k is within the anchor shell [wg_lower, wg_upper].
+    //   The lower-bound invariant holds automatically (see anchor comment above),
+    //   so only the upper bound needs an explicit check.
+    //   j = k - wg_lower fits in u32: j <= 8l-2 for any shell, << u32::MAX.
+    //
+    // Slow path: k is in a later shell than the anchor (shell boundary crossed
+    //   within this workgroup), or the k == 0 sentinel was written. In both
+    //   cases spiral_pos_slow runs the full find_shell + leg_from_lj sequence.
+    //
+    // k == 0 guard: must precede the fast-path check because the sentinel
+    //   writes wg_upper == 0, and u64_lt(0, 0) == false makes the condition
+    //   `!u64_lt(wg_upper, k)` true for k == 0; which would incorrectly
+    //   enter the fast path and underflow u64_sub(0, wg_lower).
+    var pos: vec2<i32>;
+    if (k.lo == 0u && k.hi == 0u) {
+        // k == 0 is the spiral origin. Occurs at most once, in the very first
+        // batch, for the very first candidate. Inline the shortcut here rather
+        // than calling spiral_pos_slow to make the control flow explicit.
+        pos = vec2<i32>(uniforms.start_x, uniforms.start_z);
+    } else if (!u64_lt(wg_upper, k)) {
+        // Fast path: k is in the anchor shell. Amortises find_shell across all
+        // ~255/256 threads that share a shell with thread 0. For large l (the
+        // common case far into a search) the shell spans billions of candidates,
+        // so virtually every thread in every workgroup takes this branch.
+        let j   = u64_sub(k, wg_lower).lo;
+        let off = leg_from_lj(wg_l, j, wg_four_l);
+        pos     = vec2<i32>(uniforms.start_x + off.x, uniforms.start_z + off.y);
+    } else {
+        // Slow path: shell boundary crosses this workgroup. Typically affects
+        // only one workgroup per shell transition. At l == 1 every workgroup
+        // uses the slow path (shell length == 8 << 256 threads), but shells
+        // grow as 8l so this vanishes rapidly with search depth.
+        pos = spiral_pos_slow(k, uniforms.start_x, uniforms.start_z);
+    }
+    let ox = pos.x;
+    let oz = pos.y;
 
     let dlo = U64(uniforms.dlo_lo, uniforms.dlo_hi);
     let dhi = U64(uniforms.dhi_lo, uniforms.dhi_hi);
@@ -264,6 +441,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ox_k    = bitcast<u32>(ox) * 3129871u;
     let oz_term = u64_mul(i32_to_u64(oz), U64(116129781u, 0u));
 
+    // rotation_count == 1 fast path
+    // `rotation_count` is a uniform; this branch is divergence-free: every
+    // thread in the workgroup reads the same value and takes the same side.
+    // In the single-rotation case (overwhelmingly common; four rotations are
+    // only active when the formation has full rotational symmetry) the general
+    // loop's `any_rotation_passes` bool and the `if (any_rotation_passes) { break; }`
+    // guard are purely redundant overhead. This path replaces them with a direct
+    // early-return on the first failing block, which also allows the compiler to
+    // see that there is no per-block write to `any_rotation_passes`/`rot_passes`
+    // and may unlock additional instruction folding.
+    if (uniforms.rotation_count == 1u) {
+        for (var i = 0u; i < uniforms.blocks_per_rotation; i++) {
+            let b          = blocks[i];
+            let term_x     = i32_to_u64(bitcast<i32>(ox_k + b.bx_k));
+            let term_z     = u64_add(oz_term, U64(b.bz_k_lo, b.bz_k_hi));
+            let hash       = math_hash_terms(term_x, term_z, b.by);
+            let s0         = u64_xor(hash, dlo);
+            let res        = xoroshiro_step(s0, dhi);
+            let top24      = u64_shr40(res);
+            let is_bedrock = top24 < b.prob_threshold;
+            if (!(is_bedrock == (b.should_be_bedrock != 0u))) { return; }
+        }
+        atomicMin(&result, tid);
+        return;
+    }
+
+    // General multi-rotation path
+    // atomicMin keeps the earliest (spiral-order) match in the batch.
+    // The result buffer is pre-initialised to 0xFFFF_FFFF so any hit wins.
     var any_rotation_passes = false;
     for (var r = 0u; r < uniforms.rotation_count; r++) {
         if (any_rotation_passes) { break; }
@@ -287,7 +493,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (rot_passes) { any_rotation_passes = true; }
     }
 
-    // atomicMin keeps the earliest (spiral-order) match in the batch.
-    // The result buffer is pre-initialised to 0xFFFF_FFFF so any hit wins.
     if (any_rotation_passes) { atomicMin(&result, tid); }
 }

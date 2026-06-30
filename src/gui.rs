@@ -4,7 +4,7 @@
 /// All search/computation logic lives in `crate::core`; this module holds
 /// only the application state, message handling, and view rendering.
 
-use std::sync::{Arc, atomic::{AtomicBool, AtomicI64, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicI64, Ordering}};
 
 use iced::{
     Application, Command, Element, Event, Length, Subscription, Theme, Alignment, Color,
@@ -25,7 +25,7 @@ use crate::gpu::GpuContext;
 //
 // A custom dark palette, replacing the built-in GruvboxDark theme. Note
 // `warning` and `danger` intentionally share the same teal (#007373) rather
-// than danger being red — `primary` (a deep red, #ac3232) is reserved for
+// than danger being red, `primary` (a deep red, #ac3232) is reserved for
 // the app's main affordances (the Search button, the active Y-layer tab,
 // and "non-bedrock" grid cells), while the teal marks the Cancel button and
 // "bedrock" grid cells.
@@ -138,10 +138,13 @@ enum SearchStatus {
     Idle,
     /// Actively searching; carries a human-readable area label like "10k x 10k".
     Searching(String),
-    /// Search was cancelled; carries elapsed seconds.
-    Cancelled(f64),
-    /// Match found; carries coordinates and elapsed seconds.
-    Found(i32, i32, f64),
+    /// Search was cancelled; carries how many coordinates had been found so
+    /// far and the elapsed seconds.
+    Cancelled(usize, f64),
+    /// Search ran to completion (found the requested number of matches, or
+    /// exhausted the configured limit); carries the count found and elapsed
+    /// seconds.
+    Found(usize, f64),
     Error(String),
 }
 
@@ -166,6 +169,19 @@ pub struct App {
     /// candidate position, so the result is found regardless of which
     /// compass direction the user was facing when they captured the pattern.
     search_all_rotations: bool,
+    /// Raw text of the "number of matches to find" input.
+    dup_count_str: String,
+    /// Parsed target match count. 0 means unlimited (keep searching until
+    /// cancelled or the spiral search space is exhausted).
+    dup_count:     usize,
+    /// Coordinates found by the current (or most recently completed) search,
+    /// in the order they were discovered. Displayed in a scrollable list.
+    found_coords:  Vec<(i32, i32)>,
+    /// Shared with the search worker thread while a search is running: the
+    /// worker pushes each new match here as it's found, and the GUI polls it
+    /// on the same tick subscription used for progress, so the results list
+    /// updates live instead of only at the very end.
+    found_shared:  Option<Arc<Mutex<Vec<(i32, i32)>>>>,
     status:        SearchStatus,
     cancel_flag:   Option<Arc<AtomicBool>>,
     /// Wall-clock instant when the current search started (None when idle).
@@ -222,7 +238,7 @@ enum GpuInitState {
 // IMPORTANT: this is an a-priori expectation over a randomly generated
 // world, not a claim about whether the pattern can exist. If the pattern
 // was copied from a real, already-inspected world, it already occurs there
-// at least once — a tiny E does not contradict that, it just means a
+// at least once, a tiny E does not contradict that, it just means a
 // *second* (duplicate) occurrence elsewhere is essentially impossible.
 // See `fmt_rarity` for how this is worded for the user.
 //
@@ -281,6 +297,18 @@ fn pattern_occurrence_stats(
 /// Format a large or small positive number in a compact, readable way.
 /// For E ≥ 1   : "~{value}x per world"
 /// For E < 1   : "1 in ~{1/E} worlds"
+fn format_duration(secs: f64) -> String {
+    let total = secs.round().max(0.0) as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{:02}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{:02}:{:02}", m, s)
+    }
+}
+
 fn fmt_rarity(ln_e: f64) -> (String, String) {
     // Thresholds in log-space (all values are ln of the boundary)
     const LN_1E6:  f64 =  13.815; // ln(1 000 000)
@@ -311,7 +339,7 @@ fn fmt_rarity(ln_e: f64) -> (String, String) {
         ("Very rare".into(), format!("1 in ~{:.2e} worlds", inv))
     } else {
         // Below one-in-a-million worlds. This does NOT mean the pattern
-        // can't exist — if you typed it in from a real world, it already
+        // can't exist, if you typed it in from a real world, it already
         // does. It means a *second* occurrence of this exact pattern,
         // anywhere else, is astronomically unlikely.
         ("ESSENTIALLY".into(), "UNIQUE".into())
@@ -336,6 +364,10 @@ impl Default for App {
             grid_offset_z: "0".into(),
             grid_cells:          make_grid(rows, cols),
             search_all_rotations: false,
+            dup_count_str: "1".into(),
+            dup_count:     1,
+            found_coords:  Vec::new(),
+            found_shared:  None,
             status:        SearchStatus::Idle,
             cancel_flag:   None,
             search_start:  None,
@@ -371,6 +403,9 @@ pub enum Message {
     RotateCCW,
     /// Toggle whether the search tries all 4 rotations of the pattern.
     ToggleAllRotations(bool),
+    /// Number of matching coordinates to search for before stopping
+    /// ("0" = unlimited / keep going until cancelled).
+    DupCountChanged(String),
     /// Toggle whether the GPU compute path is used for the coarse search.
     ToggleGpu(bool),
     /// Result of an async GPU probe triggered by first enabling `ToggleGpu`.
@@ -380,7 +415,13 @@ pub enum Message {
     Cancel,
     /// Fired periodically during a search with the farthest spiral index checked so far.
     SearchProgress(i64),
-    SearchDone(Result<Option<(i32, i32)>, String>),
+    /// Fired periodically during a search with a fresh snapshot of every
+    /// coordinate found so far, so the results list updates live.
+    FoundUpdate(Vec<(i32, i32)>),
+    /// `Ok((coords, was_cancelled))` once the worker stops: either the
+    /// requested number of matches were found, the search was cancelled, or
+    /// (for a "0 = unlimited" search) the spiral space was exhausted.
+    SearchDone(Result<(Vec<(i32, i32)>, bool), String>),
     ZoomIn,
     ZoomOut,
     /// Set every Unknown cell in the focused Y-layer to NonBedrock.
@@ -428,16 +469,30 @@ impl Application for App {
             None
         });
 
+        let mut subs = vec![keyboard_sub];
+
         if let Some(progress_pos) = self.progress_pos.clone() {
             // While searching, tick every 150 ms and read the shared atomic.
             let tick_sub = time::every(std::time::Duration::from_millis(150))
                 .map(move |_| {
                     Message::SearchProgress(progress_pos.load(Ordering::Relaxed))
                 });
-            Subscription::batch([keyboard_sub, tick_sub])
-        } else {
-            keyboard_sub
+            subs.push(tick_sub);
         }
+
+        if let Some(found_shared) = self.found_shared.clone() {
+            // Separate tick: snapshot the live results list so the
+            // scrollable updates as new duplicates are found, not only once
+            // the whole search finishes.
+            let found_tick = time::every(std::time::Duration::from_millis(150))
+                .map(move |_| {
+                    let snapshot = found_shared.lock().map(|g| g.clone()).unwrap_or_default();
+                    Message::FoundUpdate(snapshot)
+                });
+            subs.push(found_tick);
+        }
+
+        Subscription::batch(subs)
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {
@@ -517,6 +572,16 @@ impl Application for App {
 
             Message::ToggleAllRotations(v) => {
                 self.search_all_rotations = v;
+                Command::none()
+            }
+
+            Message::DupCountChanged(s) => {
+                self.dup_count_str = s.clone();
+                if s.is_empty() {
+                    self.dup_count = 1;
+                } else if let Ok(n) = s.parse::<usize>() {
+                    self.dup_count = n;
+                }
                 Command::none()
             }
 
@@ -617,12 +682,19 @@ impl Application for App {
                     }
                 }
                 let all_rotations = self.search_all_rotations;
+                let dup_target = self.dup_count;
                 let cancel = Arc::new(AtomicBool::new(false));
                 self.cancel_flag = Some(cancel.clone());
                 self.search_start = Some(std::time::Instant::now());
                 // Shared atomic updated by the worker; polled by the subscription tick.
                 let progress_pos = Arc::new(AtomicI64::new(0));
                 self.progress_pos = Some(progress_pos.clone());
+                // Shared list of matches found so far, updated by the worker
+                // as it goes and polled by the subscription tick so the
+                // results scrollable fills in live.
+                let found_shared: Arc<Mutex<Vec<(i32, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+                self.found_shared = Some(found_shared.clone());
+                self.found_coords.clear();
                 self.status = SearchStatus::Searching("0 x 0".into());
                 self.area_label_l = 0;
                 self.area_label_next_thresh = 1;
@@ -651,13 +723,46 @@ impl Application for App {
                                 vec![blocks_vec]
                             };
 
-                            run_search(
-                                seed, start_x, start_z, bt,
-                                rotations,
-                                cancel,
-                                Some(&|idx| { progress_pos.store(idx, Ordering::Relaxed); }),
-                                gpu_ctx,
-                            )
+                            let progress_cb = |idx: i64| { progress_pos.store(idx, Ordering::Relaxed); };
+
+                            // Repeatedly search, resuming just past each match,
+                            // until `dup_target` matches are found (0 = keep
+                            // going until cancelled / the spiral is exhausted).
+                            let mut start_group: i64 = 0;
+                            let mut results: Vec<(i32, i32)> = Vec::new();
+                            let mut was_cancelled = false;
+                            loop {
+                                if cancel.load(Ordering::Relaxed) {
+                                    was_cancelled = true;
+                                    break;
+                                }
+                                let outcome = run_search(
+                                    seed, start_x, start_z, bt,
+                                    rotations.clone(),
+                                    cancel.clone(),
+                                    Some(&progress_cb),
+                                    gpu_ctx.clone(),
+                                    start_group,
+                                );
+                                match outcome {
+                                    Ok(Some((x, z, next_group))) => {
+                                        results.push((x, z));
+                                        if let Ok(mut g) = found_shared.lock() {
+                                            g.push((x, z));
+                                        }
+                                        start_group = next_group;
+                                        if dup_target != 0 && results.len() >= dup_target {
+                                            break;
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        was_cancelled = true;
+                                        break;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            Ok((results, was_cancelled))
                         })
                             .await
                             .unwrap_or_else(|e| Err(format!("Thread panic: {e}")))
@@ -671,6 +776,7 @@ impl Application for App {
                 // Flip status immediately so the UI responds; SearchDone will
                 // report the precise elapsed time when it arrives.
                 self.status = SearchStatus::Cancelled(
+                    self.found_coords.len(),
                     self.search_start.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
                 );
                 Command::none()
@@ -721,17 +827,30 @@ impl Application for App {
                 Command::none()
             }
 
+            Message::FoundUpdate(coords) => {
+                self.found_coords = coords;
+                Command::none()
+            }
+
             Message::SearchDone(result) => {
                 let elapsed = self.search_start
                     .take()
                     .map(|t| t.elapsed().as_secs_f64())
                     .unwrap_or(0.0);
-                self.cancel_flag = None;
+                self.cancel_flag  = None;
                 self.progress_pos = None;
+                self.found_shared = None;
                 self.status = match result {
-                    Ok(Some((x, z))) => SearchStatus::Found(x, z, elapsed),
-                    Ok(None)         => SearchStatus::Cancelled(elapsed),
-                    Err(e)           => SearchStatus::Error(e),
+                    Ok((coords, was_cancelled)) => {
+                        let count = coords.len();
+                        self.found_coords = coords;
+                        if was_cancelled {
+                            SearchStatus::Cancelled(count, elapsed)
+                        } else {
+                            SearchStatus::Found(count, elapsed)
+                        }
+                    }
+                    Err(e) => SearchStatus::Error(e),
                 };
                 Command::none()
             }
@@ -795,7 +914,7 @@ impl Application for App {
         ].spacing(sc(10.0) as u16).align_items(Alignment::Center);
 
         // Section: Pattern grid
-        // Laid out as [grid] | [panel] — the grid sits on the left where it
+        // Laid out as [grid] | [panel], the grid sits on the left where it
         // has room to breathe, and every control that configures or acts on
         // it (size/offset, Y layer, rotate/fill/clear, legend) is gathered
         // into a single compact panel on the right, instead of trailing
@@ -861,8 +980,8 @@ impl Application for App {
             y_row = y_row.push(btn);
         }
 
-        // Cell grid — the visual centerpiece, kept on the left with nothing
-        // crowding it.
+        // Cell grid
+        // The visual centerpiece, kept on the left with nothing crowding it.
         let mut grid_col: Column<'_, Message> = Column::new().spacing(sc(3.0) as u16);
         for row_idx in 0..self.grid_rows {
             let mut grid_row: Row<'_, Message> = Row::new().spacing(sc(3.0) as u16);
@@ -916,8 +1035,9 @@ impl Application for App {
                 .padding([sc(4.0) as u16, sc(10.0) as u16]),
         ].spacing(sc(6.0) as u16).align_items(Alignment::Center);
 
-        // Legend, stacked vertically rather than strung out horizontally —
-        // reads naturally as a short key in a narrow side panel.
+        // Legend
+        // Stacked vertically rather than strung out horizontally;
+        // reads naturally as a short key in a narrow side panel
         let legend = Column::new()
             .spacing(sc(3.0) as u16)
             .push(text("Legend").size(sc(12.0) as u16))
@@ -928,8 +1048,9 @@ impl Application for App {
             .push(Space::with_height(Length::Fixed(sc(6.0))))
             .push(text("Right-click to reverse").size(sc(11.0) as u16));
 
-        // Pattern rarity panel — shown to the right of the legend. Updates
-        // in real time as the user fills cells, using only the cells that are
+        // Pattern rarity panel
+        // Shown to the right of the legend.
+        // Updates in real time as the user fills cells, using only the cells that are
         // actually set (not the grid dimensions), so a 2x8 pattern and a 4x4
         // pattern with the same number of constrained cells show the same odds.
         let hsz = sc(12.0) as u16; // header size, matches the "Legend" header
@@ -942,7 +1063,7 @@ impl Application for App {
 
         match pattern_occurrence_stats(&self.grid_cells, self.bedrock_type) {
             None => {
-                // No cells filled yet — gently prompt the user.
+                // No cells filled yet; gently prompt the user.
                 rarity_col = rarity_col
                     .push(text("(Fill grid cells").size(rsz))
                     .push(text("to see odds)").size(rsz));
@@ -955,7 +1076,7 @@ impl Application for App {
 
                 // When E is below one-in-a-million, a *second* occurrence of
                 // this exact pattern anywhere else is essentially impossible.
-                // This doesn't mean the pattern itself can't exist — if it
+                // This doesn't mean the pattern itself can't exist; if it
                 // came from a real world, it already does, once.
                 if ln_e <= -13.816 {
                     rarity_col = rarity_col
@@ -998,7 +1119,8 @@ impl Application for App {
             ).on_toggle(Message::ToggleAllRotations).text_size(sc(13.0) as u16),
         ].align_items(Alignment::Center);
 
-        // GPU toggle row — always shown; probed lazily on first enable.
+        // GPU toggle row
+        // Always shown; probed lazily on first enable.
         let gpu_label = match &self.gpu_init {
             GpuInitState::Probing     => "Checking for a GPU\u{2026}".to_string(),
             GpuInitState::Unavailable => "GPU not available on this system".to_string(),
@@ -1010,6 +1132,19 @@ impl Application for App {
                 .on_toggle(Message::ToggleGpu)
                 .text_size(sc(13.0) as u16),
         ].align_items(Alignment::Center);
+
+        // How many matching coordinates to look for before stopping. "0"
+        // means keep searching indefinitely (until cancelled), useful for
+        // hunting down every duplicate of a pattern.
+        let dup_row = row![
+            text("Find").size(sc(13.0) as u16).width(Length::Fixed(sc(40.0))),
+            text_input("1", &self.dup_count_str)
+                .on_input(Message::DupCountChanged)
+                .size(sc(14.0) as u16)
+                .width(Length::Fixed(sc(60.0)))
+                .padding(sc(6.0) as u16),
+            text("coordinate(s)  (0 = scan until cancelled)").size(sc(13.0) as u16),
+        ].spacing(sc(8.0) as u16).align_items(Alignment::Center);
 
         // Search / Cancel buttons
         // Search gets Primary style so it stands out; Cancel gets Destructive
@@ -1034,14 +1169,47 @@ impl Application for App {
                 .padding([sc(10.0) as u16, sc(22.0) as u16])
         };
 
+        // Pluralize "N coordinate(s)" consistently across status messages.
+        let fmt_coord_count = |n: usize| {
+            if n == 1 { "1 coordinate".to_string() } else { format!("{} coordinates", n) }
+        };
+
         // Status bar
         let status_msg = match &self.status {
-            SearchStatus::Idle              => text("Ready.").size(sc(15.0) as u16),
-            SearchStatus::Searching(area)   => text(format!("Searching {}\u{2026}", area)).size(sc(15.0) as u16),
-            SearchStatus::Cancelled(secs)   => text(format!("Cancelled after {:.1}s.", secs)).size(sc(15.0) as u16),
-            SearchStatus::Found(x, z, secs) => text(format!("Found at  X: {}   Z: {}   ({:.1}s)", x, z, secs)).size(sc(17.0) as u16),
-            SearchStatus::Error(e)          => text(format!("Error: {}", e)).size(sc(15.0) as u16),
+            SearchStatus::Idle                => text("Ready.").size(sc(15.0) as u16),
+            SearchStatus::Searching(area)     => text(format!("Searching {}\u{2026}", area)).size(sc(15.0) as u16),
+            SearchStatus::Cancelled(n, secs)  => text(format!(
+                "Cancelled after {}; {} found.", format_duration(*secs), fmt_coord_count(*n)
+            )).size(sc(15.0) as u16),
+            SearchStatus::Found(n, secs)      => text(format!(
+                "{} found  ({})", fmt_coord_count(*n), format_duration(*secs)
+            )).size(sc(17.0) as u16),
+            SearchStatus::Error(e)            => text(format!("Error: {}", e)).size(sc(15.0) as u16),
         };
+
+        // Results list
+        // Scrollable so any number of duplicate matches can be
+        // browsed without growing the rest of the window. Updates live while
+        // a search with "Find" > 1 (or 0/unlimited) is in progress.
+        let mut results_col: Column<'_, Message> = Column::new().spacing(sc(4.0) as u16);
+        if self.found_coords.is_empty() {
+            results_col = results_col.push(
+                text("No coordinates found yet.").size(sc(13.0) as u16)
+            );
+        } else {
+            for (i, (x, z)) in self.found_coords.iter().enumerate() {
+                results_col = results_col.push(
+                    text(format!("{:>4}.   X: {:<10}  Z: {}", i + 1, x, z))
+                        .size(sc(14.0) as u16)
+                );
+            }
+        }
+        let results_panel = container(
+            scrollable(results_col).height(Length::Fixed(sc(140.0)))
+        )
+            .width(Length::Fill)
+            .padding(sc(10.0) as u16)
+            .style(theme::Container::Box);
 
         // Layout assembly
         let content = Column::new()
@@ -1081,6 +1249,8 @@ impl Application for App {
             .push(all_rotations_row)
             .push(Space::with_height(Length::Fixed(sc(8.0))))
             .push(gpu_row)
+            .push(Space::with_height(Length::Fixed(sc(8.0))))
+            .push(dup_row)
             .push(Space::with_height(Length::Fixed(sc(16.0))))
             .push(horizontal_rule(1))
             .push(Space::with_height(Length::Fixed(sc(16.0))))
@@ -1103,7 +1273,9 @@ impl Application for App {
                     .width(Length::Fill)
                     .center_x()
                     .padding([sc(10.0) as u16, sc(16.0) as u16])
-            );
+            )
+            .push(Space::with_height(Length::Fixed(sc(8.0))))
+            .push(results_panel);
 
         container(scrollable(content)).width(Length::Fill).height(Length::Fill).center_x().into()
     }

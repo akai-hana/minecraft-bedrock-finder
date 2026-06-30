@@ -3,10 +3,11 @@
 /// Key design: candidate positions are computed **inside the shader** from each
 /// thread's global invocation ID using the closed-form spiral formula.  There is
 /// no candidate buffer, no sequential CPU position loop, and no multi-MB upload
-/// per batch - the CPU cost per dispatch is a single 48-byte uniform write and
-/// one 4-byte result readback.
+/// per batch - the CPU cost per dispatch is a single 48-byte uniform write (or
+/// push-constant set) and one 4-byte result readback.
 
 use bytemuck::{Pod, Zeroable, bytes_of, cast_slice, pod_read_unaligned};
+use wgpu::util::DeviceExt;
 
 use crate::core::{GROUPS_PER_CHUNK};
 
@@ -27,8 +28,8 @@ pub struct SearchUniforms {
     pub batch_base_k_lo:     u32,   // offset 24 -- low 32 bits of the absolute spiral index of candidate 0
     pub start_x:             i32,   // offset 28
     pub start_z:             i32,   // offset 32
-    /// Number of threads per dispatched "row" (= workgroups_x * 256). Used to
-    /// turn the 2-D dispatch grid back into a single linear candidate index:
+    /// Number of threads per dispatched "row" (= workgroups_x * GPU_WORKGROUP_SIZE).
+    /// Used to turn the 2-D dispatch grid back into a single linear candidate index:
     /// tid = gid.y * dispatch_width + gid.x. See `search_batch` for why a 2-D
     /// grid is needed at all (the 1-D workgroup-count limit is 65 535).
     pub dispatch_width:      u32,   // offset 36
@@ -77,28 +78,77 @@ const MAX_BLOCKS_PER_ROTATION: u64 = 1024;
 /// Block buffer holds up to 4 rotations back-to-back.
 const MAX_TOTAL_BLOCKS: u64 = 4 * MAX_BLOCKS_PER_ROTATION;
 
+// Workgroup size
+//
+// This constant is the single source of truth for the GPU compute workgroup
+// size on the Rust side (used by the dispatch arithmetic in `search_batch`).
+// It is NOT passed into the shader at pipeline-creation time. That would
+// normally use a WGSL `override` constant plus
+// `PipelineCompilationOptions::constants`, but neither is available here:
+// the naga WGSL frontend bundled with this project's pinned wgpu (0.19)
+// doesn't parse `override` declarations at all, and the
+// `compilation_options`/`cache` pipeline-descriptor fields don't exist until
+// wgpu 22. So `search.wgsl` instead declares `WORKGROUP_SIZE_X` as a plain
+// `const`, hardcoded to 256. That means this constant must currently stay
+// 256 too; changing it here without also editing the shader's `const` will
+// desync the two sides. (If you later upgrade wgpu, both the shader's
+// `const` -> `override` and this comment can be revisited.)
+//
+// Values to benchmark: 64, 128, 256, 512.  The U64 emulation in the shader
+// raises per-thread register pressure compared to a native-i64 kernel, which
+// can silently cap occupancy at the driver level.  Smaller workgroup sizes free
+// registers and can improve occupancy on register-pressure-sensitive GPUs (AMD
+// RDNA, older GCN); larger sizes may improve IPC on warp-wide execution
+// hardware (NVIDIA Ampere/Ada, Intel Arc).  Measure on your target hardware
+// with the microbenchmark described in the Section 1 validation notes.
+const GPU_WORKGROUP_SIZE: u32 = 256;
+
 // GpuContext
 
 pub struct GpuContext {
-    device:      wgpu::Device,
-    queue:       wgpu::Queue,
-    pipeline:    wgpu::ComputePipeline,
+    device:             wgpu::Device,
+    queue:              wgpu::Queue,
+    pipeline:           wgpu::ComputePipeline,
     /// Pre-built bind group reused every batch.
     ///
     /// The bind group references the buffer *objects*, not their contents.
-    /// Writing new data into `uniform_buf` and `result_buf` each batch is
-    /// perfectly valid - the bind group only needs to be rebuilt if the buffer
-    /// handles themselves change, which they never do here.
-    bind_group:  wgpu::BindGroup,
-    uniform_buf: wgpu::Buffer,
-    block_buf:   wgpu::Buffer,
-    result_buf:  wgpu::Buffer,
-    staging_buf: wgpu::Buffer,
+    /// Writing new data into `uniform_buf` (or setting push constants) each
+    /// batch is perfectly valid; the bind group only needs to be rebuilt if
+    /// the buffer handles themselves change, which they never do here.
+    bind_group:         wgpu::BindGroup,
+    /// Uniform buffer used to upload `SearchUniforms` when push constants are
+    /// unavailable on the current backend. `None` when `use_push_constants` is
+    /// true; in that case uniforms are set via `ComputePass::set_push_constants`
+    /// and no uniform buffer is allocated.
+    uniform_buf:        Option<wgpu::Buffer>,
+    block_buf:          wgpu::Buffer,
+    result_buf:         wgpu::Buffer,
+    staging_buf:        wgpu::Buffer,
+    /// 4-byte buffer permanently pre-filled with `0xFFFF_FFFF`, used as the
+    /// copy source for the per-batch result-sentinel reset.  Allocated once in
+    /// `new` with `COPY_SRC` usage; its contents never change.  Encoding the
+    /// reset as `copy_buffer_to_buffer` into the command stream means the GPU
+    /// DMA engine handles it without any CPU→GPU `write_buffer` call per batch.
+    sentinel_buf:       wgpu::Buffer,
+    /// True when `wgpu::Features::PUSH_CONSTANTS` was successfully requested
+    /// from the adapter.  Affects the pipeline layout, the shader binding
+    /// declaration (patched at creation time), and the per-batch uniform upload
+    /// path in `search_batch`.
+    ///
+    /// Push constants skip a small buffer write plus its binding indirection
+    /// per batch.  On Vulkan and DX12 this is typically a direct register write
+    /// with no GPU memory traffic; on Metal it maps to argument buffers with
+    /// similar characteristics.  The uniform-buffer path is kept as an automatic
+    /// fallback for backends that do not expose the feature (WebGPU, some OpenGL
+    /// compatibility layers).
+    use_push_constants: bool,
 }
 
 impl std::fmt::Debug for GpuContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GpuContext").finish_non_exhaustive()
+        f.debug_struct("GpuContext")
+            .field("use_push_constants", &self.use_push_constants)
+            .finish_non_exhaustive()
     }
 }
 
@@ -117,12 +167,35 @@ impl GpuContext {
             })
             .await?;
 
+        // Probe for push-constant support before device creation.  This feature
+        // is available on Vulkan, DX12, and Metal but NOT on WebGPU or on some
+        // older OpenGL/ES adapters; the fallback path (uniform buffer) is used
+        // transparently when the feature is absent.
+        let uniform_size = std::mem::size_of::<SearchUniforms>() as u32;
+        let has_push_constants = adapter
+            .features()
+            .contains(wgpu::Features::PUSH_CONSTANTS);
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label:             None,
-                    required_features: wgpu::Features::empty(),
-                    required_limits:   wgpu::Limits::default(),
+                    required_features: if has_push_constants {
+                        wgpu::Features::PUSH_CONSTANTS
+                    } else {
+                        wgpu::Features::empty()
+                    },
+                    required_limits: if has_push_constants {
+                        wgpu::Limits {
+                            // Request exactly the space we need; some drivers
+                            // have a very low default ceiling (128 bytes is
+                            // guaranteed by the Vulkan spec).
+                            max_push_constant_size: uniform_size,
+                            ..wgpu::Limits::default()
+                        }
+                    } else {
+                        wgpu::Limits::default()
+                    },
                     ..Default::default()
                 },
                 None,
@@ -130,69 +203,113 @@ impl GpuContext {
             .await
             .ok()?;
 
+        // Patch the shader source when push constants are available: replace the
+        // uniform-buffer binding declaration with a push-constant declaration.
+        // The two forms are otherwise syntactically identical in WGSL; the rest
+        // of the kernel code (`uniforms.foo`) is unchanged.
+        //
+        // The `@group(0) @binding(0)` prefix is included in the search string so
+        // this replacement is uniquely anchored and won't accidentally match any
+        // other `var<uniform>` declaration added in the future.
+        const UNIFORM_BINDING_DECL: &str =
+            "@group(0) @binding(0) var<uniform>             uniforms: SearchUniforms;";
+        const PUSH_CONST_DECL: &str =
+            "var<push_constant> uniforms: SearchUniforms;";
+
+        let shader_src: std::borrow::Cow<'static, str> = if has_push_constants {
+            let patched = include_str!("search.wgsl")
+                .replace(UNIFORM_BINDING_DECL, PUSH_CONST_DECL);
+            debug_assert!(
+                patched.contains(PUSH_CONST_DECL),
+                "push-constant shader patch failed: uniform binding declaration not found; \
+                 check that UNIFORM_BINDING_DECL in gpu.rs exactly matches the line in search.wgsl"
+            );
+            patched.into()
+        } else {
+            include_str!("search.wgsl").into()
+        };
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label:  Some("bedrock_search"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("search.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_src),
         });
 
-        // 3 bindings: uniform | ro-storage (blocks) | rw-storage (result)
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label:   None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding:    0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty:                 wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size:   None,
-                    },
-                    count: None,
-                },
+        // Bind group layout.
+        //
+        // When push constants are active, binding 0 (the uniform buffer) is
+        // absent from the layout; it is no longer a buffer binding at all.
+        // Bindings 1 (blocks, read-only storage) and 2 (result, read-write
+        // storage/atomic) are the same in both cases.
+        let storage_block_entry = wgpu::BindGroupLayoutEntry {
+            binding:    1,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty:                 wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size:   None,
+            },
+            count: None,
+        };
+        let storage_result_entry = wgpu::BindGroupLayoutEntry {
+            binding:    2,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty:                 wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size:   None,
+            },
+            count: None,
+        };
 
-                wgpu::BindGroupLayoutEntry {
-                    binding:    1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty:                 wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size:   None,
-                    },
-                    count: None,
+        let bgl = if has_push_constants {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label:   None,
+                entries: &[storage_block_entry, storage_result_entry],
+            })
+        } else {
+            let uniform_entry = wgpu::BindGroupLayoutEntry {
+                binding:    0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty:                 wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size:   None,
                 },
+                count: None,
+            };
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label:   None,
+                entries: &[uniform_entry, storage_block_entry, storage_result_entry],
+            })
+        };
 
-                wgpu::BindGroupLayoutEntry {
-                    binding:    2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty:                 wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size:   None,
-                    },
-
-                    count: None,
-                },
-            ],
-        });
+        // Pipeline layout: push-constant range is declared here when the feature
+        // is active so the driver can allocate the right register space.
+        let push_constant_ranges: Vec<wgpu::PushConstantRange> = if has_push_constants {
+            vec![wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range:  0..uniform_size,
+            }]
+        } else {
+            vec![]
+        };
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label:                Some("bedrock_layout"),
             bind_group_layouts:   &[&bgl],
-            push_constant_ranges: &[],
+            push_constant_ranges: &push_constant_ranges,
         });
 
+        // No workgroup-size override here: `search.wgsl` declares
+        // `WORKGROUP_SIZE_X` as a plain `const` (see the comment by
+        // `GPU_WORKGROUP_SIZE` above for why), so its value is fixed at
+        // shader-compile time and there's nothing to inject at
+        // pipeline-creation time.
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label:       Some("bedrock_pipeline"),
             layout:      Some(&pipeline_layout),
             module:      &shader,
             entry_point: "main",
-        });
-
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("uniforms"),
-            size:               std::mem::size_of::<SearchUniforms>() as u64,
-            usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
 
         let block_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -218,25 +335,75 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
-        // Build the bind group once.  The three buffer *objects* are fixed for
-        // the lifetime of this GpuContext; only their contents change between
-        // batches.  Rebuilding the bind group on every `search_batch` call would
-        // incur driver-side descriptor-set allocation and layout validation for
-        // no reason.
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("bedrock_bg"),
-            layout:  &bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: block_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: result_buf.as_entire_binding() },
-            ],
+        // Uniform buffer: only allocated when push constants are unavailable.
+        let uniform_buf: Option<wgpu::Buffer> = if has_push_constants {
+            None
+        } else {
+            Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label:              Some("uniforms"),
+                size:               std::mem::size_of::<SearchUniforms>() as u64,
+                usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+        };
+
+        // Sentinel buffer: 4 bytes permanently set to 0xFFFF_FFFF.
+        //
+        // Each batch resets `result_buf` to this value before the compute pass
+        // so that the shader's `atomicMin` starts from the "no hit" state.
+        // Encoding the reset as `copy_buffer_to_buffer` (GPU-side DMA) into the
+        // command stream avoids one `queue.write_buffer` (CPU→GPU transfer) per
+        // batch compared to the old approach.  The contents of this buffer are
+        // written once here and never touched again.
+        let sentinel_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("sentinel"),
+            contents: &0xFFFF_FFFFu32.to_le_bytes(),
+            usage:    wgpu::BufferUsages::COPY_SRC,
         });
+
+        // Build the bind group once.  The buffer *objects* are fixed for the
+        // lifetime of this GpuContext; only their contents change between batches.
+        // Rebuilding the bind group on every `search_batch` call would incur
+        // driver-side descriptor-set allocation and layout validation for no reason.
+        let bind_group = if has_push_constants {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label:   Some("bedrock_bg"),
+                layout:  &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 1, resource: block_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: result_buf.as_entire_binding() },
+                ],
+            })
+        } else {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label:   Some("bedrock_bg"),
+                layout:  &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding:  0,
+                        resource: uniform_buf.as_ref().unwrap().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: block_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: result_buf.as_entire_binding() },
+                ],
+            })
+        };
         // `bgl` is no longer needed after the bind group and pipeline layout are
         // built.  Let it drop here; the bind group holds an internal reference
         // that keeps the layout alive as long as `bind_group` is live.
 
-        Some(Self { device, queue, pipeline, bind_group, uniform_buf, block_buf, result_buf, staging_buf })
+        Some(Self {
+            device,
+            queue,
+            pipeline,
+            bind_group,
+            uniform_buf,
+            block_buf,
+            result_buf,
+            staging_buf,
+            sentinel_buf,
+            use_push_constants: has_push_constants,
+        })
     }
 
     /// Write the block data to the GPU buffer.
@@ -256,8 +423,14 @@ impl GpuContext {
     /// Search `num_chunks` consecutive spiral chunks in a single GPU dispatch.
     ///
     /// CPU cost per call:
-    ///   - 48 bytes written to the uniform buffer
+    ///   - 48 bytes written via one `queue.write_buffer` (uniform-buffer path)
+    ///     or one `ComputePass::set_push_constants` call (push-constant path)
     ///   - 4 bytes read back via a staging buffer
+    ///
+    /// The result-sentinel reset (writing 0xFFFF_FFFF to the result buffer) is
+    /// encoded into the command stream via `encoder.fill_buffer` rather than a
+    /// second `queue.write_buffer`, so only a single host->GPU write is needed
+    /// per batch for the uniform/push-constant payload.
     ///
     /// Block data must have been uploaded by a preceding `write_blocks` call;
     /// it is not re-written here (blocks are constant within a `run_search`
@@ -265,12 +438,12 @@ impl GpuContext {
     /// bandwidth for long searches).
     ///
     /// All candidate (x, z) positions are computed on the GPU from the global
-    /// thread ID using the closed-form spiral formula - there is no candidate
+    /// thread ID using the closed-form spiral formula; there is no candidate
     /// buffer and no multi-MB upload.
     ///
     /// `blocks` and `rotation_count` are still required here to derive the
-    /// `blocks_per_rotation` value written into the uniform buffer; no
-    /// buffer upload is performed.
+    /// `blocks_per_rotation` value written into the uniform buffer; no buffer
+    /// upload is performed for them.
     ///
     /// Returns `Some(chunk_index_within_batch)` on a hit, `None` otherwise.
     pub fn search_batch(
@@ -322,10 +495,9 @@ impl GpuContext {
         // shader as `tid = gid.y * dispatch_width + gid.x`. For the common
         // case (total_workgroups <= 65 535) this degenerates to the original
         // 1-D dispatch (dispatch_y == 1).
-        const WORKGROUP_SIZE:        u32 = 256;
         const MAX_WORKGROUPS_PER_DIM: u32 = 65_535;
 
-        let total_workgroups = (candidate_count + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        let total_workgroups = (candidate_count + GPU_WORKGROUP_SIZE - 1) / GPU_WORKGROUP_SIZE;
         let dispatch_x = if total_workgroups <= MAX_WORKGROUPS_PER_DIM {
             total_workgroups.max(1)
         } else {
@@ -336,9 +508,10 @@ impl GpuContext {
         };
         let dispatch_y = ((total_workgroups + dispatch_x - 1) / dispatch_x)
             .clamp(1, MAX_WORKGROUPS_PER_DIM);
-        let dispatch_width = dispatch_x * WORKGROUP_SIZE;
+        let dispatch_width = dispatch_x * GPU_WORKGROUP_SIZE;
 
-        // 1. Write uniforms (48 bytes; negligible cost).
+        // Build the uniform struct (used by both the uniform-buffer path and
+        // the push-constant path; the bytes are the same either way).
         let uniforms = SearchUniforms {
             dlo_lo:              (dlo as u64 & 0xFFFF_FFFF) as u32,
             dlo_hi:              ((dlo as u64) >> 32) as u32,
@@ -353,18 +526,42 @@ impl GpuContext {
             rotation_count,
             batch_base_k_hi,
         };
-        self.queue.write_buffer(&self.uniform_buf, 0, bytes_of(&uniforms));
 
-        // 2. Reset result sentinel.
-        let sentinel: u32 = 0xFFFF_FFFF;
-        self.queue.write_buffer(&self.result_buf, 0, bytes_of(&sentinel));
+        // 1. Upload per-batch parameters.
+        //
+        // Push-constant path: `set_push_constants` is called inside the compute
+        // pass below (it must be called after `set_pipeline`), so nothing to do
+        // here on the CPU side before encoding.
+        //
+        // Uniform-buffer path: write the 48-byte uniform blob in a single
+        // `write_buffer` call.  The result-sentinel reset is handled by a
+        // GPU-side `copy_buffer_to_buffer` encoded into the command stream
+        // (step 2), so only one host→GPU write is needed per batch.
+        if !self.use_push_constants {
+            self.queue.write_buffer(
+                self.uniform_buf.as_ref().expect("uniform_buf must be Some when not using push constants"),
+                0,
+                bytes_of(&uniforms),
+            );
+        }
 
-        // 3. Encode, dispatch, copy result to staging.
+        // 2. Encode, dispatch, copy result to staging.
         //    The bind group is already built and cached in `self.bind_group` -
         //    no allocation or validation happens here.
         let mut enc = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("search_batch") },
         );
+
+        // Reset result sentinel via GPU-side DMA copy from `sentinel_buf`.
+        // `sentinel_buf` is a 4-byte buffer permanently pre-filled with
+        // 0xFFFF_FFFF (the "no hit" value).  Encoding this as
+        // `copy_buffer_to_buffer` instead of a CPU-side `queue.write_buffer`
+        // means the reset travels through the same command stream as the
+        // dispatch and the result copy, so the GPU command buffer is fully
+        // self-contained: reset → dispatch → copy result to staging.
+        // This eliminates one CPU→GPU `write_buffer` call per batch.
+        enc.copy_buffer_to_buffer(&self.sentinel_buf, 0, &self.result_buf, 0, 4);
+
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label:            Some("search_pass"),
@@ -372,12 +569,20 @@ impl GpuContext {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
+
+            // Push-constant path: set uniforms directly into shader registers.
+            // This must be called after `set_pipeline` (the pipeline layout
+            // defines which push-constant ranges are valid).
+            if self.use_push_constants {
+                pass.set_push_constants(0, bytes_of(&uniforms));
+            }
+
             pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         }
         enc.copy_buffer_to_buffer(&self.result_buf, 0, &self.staging_buf, 0, 4);
         self.queue.submit(std::iter::once(enc.finish()));
 
-        // 4. Single blocking readback - one poll per batch, not per chunk.
+        // 3. Single blocking readback - one poll per batch, not per chunk.
         //
         // A yield-loop over `Maintain::Poll` is used instead of `Maintain::Wait`
         // to avoid pinning the calling thread for the full GPU execution window.

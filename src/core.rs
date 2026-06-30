@@ -198,6 +198,7 @@ pub fn prob_to_threshold(probability: f64) -> u64 {
     (probability * 16_777_216.0_f64) as u64
 }
 
+#[derive(Clone)]
 pub struct Block {
     pub x: i32, pub y: i32, pub z: i32,
     pub should_be_bedrock: bool,
@@ -1375,8 +1376,11 @@ pub fn area_label_from_l(l: i64) -> String {
 }
 
 // Wraps the original spiral search loop with a cancellation flag checked once
-// per chunk.  Returns Ok(Some((x, z))) on success, Ok(None) if cancelled, or
-// Err if the block constraints are impossible.
+// per chunk.  Returns Ok(Some((x, z, resume_group))) on success where
+// `resume_group` is the spiral group index to pass back in as `start_group`
+// on a subsequent call in order to keep searching *past* this match (used to
+// find duplicate/N-th occurrences of the same pattern), Ok(None) if
+// cancelled, or Err if the block constraints are impossible.
 pub fn run_search(
     seed: i64,
     start_x: i32,
@@ -1397,8 +1401,14 @@ pub fn run_search(
     // the CPU scalar walk is used only for hit confirmation. When None,
     // the existing SIMD/scalar CPU path is used exclusively.
     gpu_ctx: Option<Arc<GpuContext>>,
-) -> Result<Option<(i32, i32)>, String> {
-    if rotations.is_empty() { return Ok(Some((start_x, start_z))); }
+    // Spiral group index to begin searching from. Pass 0 to search from the
+    // configured center outward as usual; pass the `resume_group` returned by
+    // a previous call to continue past a match already found (so repeated
+    // calls walk the spiral forward and surface successive, non-overlapping
+    // occurrences instead of re-finding the same one).
+    start_group: i64,
+) -> Result<Option<(i32, i32, i64)>, String> {
+    if rotations.is_empty() { return Ok(Some((start_x, start_z, start_group + 1))); }
 
     // Validate, sort, and filter each rotation's block list independently.
     // A rotation rearranges block *positions* but the per-block validity
@@ -1431,7 +1441,7 @@ pub fn run_search(
 
         // If any single rotation has no remaining constraints, every position
         // (including the start) trivially satisfies it.
-        if blocks.is_empty() { return Ok(Some((start_x, start_z))); }
+        if blocks.is_empty() { return Ok(Some((start_x, start_z, start_group + 1))); }
 
         blocks_per_rotation.push(blocks);
     }
@@ -1510,7 +1520,7 @@ pub fn run_search(
         })
     };
 
-    let mut batch_start_group: i64 = 0;
+    let mut batch_start_group: i64 = start_group;
 
     // Write block data once - it's constant for this entire search.
     if let (Some(ctx), Some(gblocks)) = (gpu_ctx.as_ref(), gpu_blocks.as_deref()) {
@@ -1682,7 +1692,14 @@ pub fn run_search(
                         let ox_t = xs[p].wrapping_mul(3_129_871_i32);
                         let oz_t = (zs[p] as i64).wrapping_mul(116_129_781_i64);
                         if blocks_list.iter().any(|blocks| check_formation_with_terms(ox_t, oz_t, dlo, dhi, blocks)) {
-                            return Ok(Some((xs[p], zs[p])));
+                            // Resume point for a subsequent call: the next
+                            // spiral group after this one. Walking forward by
+                            // a whole group (rather than the exact position)
+                            // means a second match within the same 8-position
+                            // group would be skipped, but that is astronomically
+                            // unlikely for any pattern worth searching for.
+                            let resume_group = chunk_base_group + g + 1;
+                            return Ok(Some((xs[p], zs[p], resume_group)));
                         }
                     }
                     // The scalar group scan confirmed a hit above but no individual
